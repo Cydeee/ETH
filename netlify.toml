@@ -1,0 +1,10 @@
+[build]
+  publish = "."
+
+[[edge_functions]]
+  path     = "/data"
+  function = "data"
+
+[[edge_functions]]
+  path     = "/data.html"
+  function = "data-page"
