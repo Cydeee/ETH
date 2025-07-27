@@ -1,0 +1,13 @@
+{
+  "name": "high-conviction-alerts",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "alert": "node .github/scripts/alert.js"
+  },
+  "dependencies": {
+    "https-proxy-agent": "^7.0.0",
+    "node-fetch": "^3.3.2"
+  }
+}
