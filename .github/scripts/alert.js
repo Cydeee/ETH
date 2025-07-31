@@ -1,182 +1,332 @@
 #!/usr/bin/env node
-/*  alert.js – ETH High‑conviction notifier (5‑min cron, 60‑min mute)
-    -----------------------------------------------------------------
-    ENV REQUIRED
-      SYMBOL               – Binance symbol (default ETHUSDT)
-      TELEGRAM_BOT_TOKEN   – bot token from @BotFather
-      TELEGRAM_CHAT_ID     – numeric chat or channel ID
-      LIVE_URL             – Netlify endpoint returning dashboard JSON
-    OPTIONAL
-      HTTPS_PROXY          – http://user:pass@host:port
-      DEBUG=true           – verbose logs + no mute
+/*  alert.js – ETH notifier (5-min cron, 60-min mute)
+    v2 ▸ adds unified Quality-score (1-10) with per-play weights & tiered bonuses.
+           Alerts STILL print when a setup is below its gate – they’re just labelled.
 */
 
-import fs    from "fs";
+import fs   from "fs";
 import fetch from "node-fetch";
 import { HttpsProxyAgent } from "https-proxy-agent";
 
-/* ───────── 0 ▸ ENV & utils ───────── */
+/* ───────── 0 ▸ ENV ---------------------------------------------------------------- */
 const {
-  SYMBOL = "ETHUSDT",
   TELEGRAM_BOT_TOKEN: BOT,
-  TELEGRAM_CHAT_ID : CHAT,
-  LIVE_URL         : LIVE,
-  HTTPS_PROXY      : PROXY
+  TELEGRAM_CHAT_ID  : CHAT,
+  LIVE_URL          : LIVE,
+  HTTPS_PROXY       : PROXY,
+  DEBUG,
+  RISK_PCT
 } = process.env;
 
 if (!BOT || !CHAT || !LIVE) {
-  console.error("❌ Missing env vars (BOT, CHAT, LIVE_URL)"); process.exit(1);
+  console.error("❌  Missing env vars (BOT, CHAT, LIVE_URL)"); process.exit(1);
 }
 
-const DEBUG  = process.env.DEBUG === "true";
-const ASSET  = SYMBOL.replace(/USDT$/,"");            // "ETH"
 const agent  = PROXY ? new HttpsProxyAgent(PROXY) : undefined;
+const riskPc = parseFloat(RISK_PCT) || 0.5;
+const isDbg  = DEBUG === "true";
 
-const tg = text => fetch(
-  `https://api.telegram.org/bot${BOT}/sendMessage`,
-  {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: CHAT,
-      text,
-      parse_mode: "Markdown",
-      disable_web_page_preview: true
-    })
+/* ───────── helpers ---------------------------------------------------------------- */
+const $   = n => Number(n || 0);
+const pct = (a,b)=>b?((a-b)/b*100):0;
+const fmt = (n,d=0)=>n.toLocaleString("en-US",{minimumFractionDigits:d,maximumFractionDigits:d});
+const fmt$= n => "$"+fmt(n);
+const esc = s => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+const LOG=[]; const dbg = m => { if(isDbg) LOG.push(m); };
+
+async function tg(html){
+  const r=await fetch(`https://api.telegram.org/bot${BOT}/sendMessage`,{
+    method:"POST",agent,
+    headers:{ "Content-Type":"application/json" },
+    body:JSON.stringify({chat_id:CHAT,text:html,parse_mode:"HTML",disable_web_page_preview:true})
   });
+  const j=await r.json(); if(isDbg) console.log("TG:",j);
+  if(!j.ok) throw new Error(`Telegram error: ${j.description}`);
+}
 
-const fmt$ = n => "$" + Number(n).toLocaleString("en-US");   // thousands‑sep
+const safeJson = u => fetch(u,{agent,timeout:20_000})
+  .then(r=>{ if(!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
 
-/* ───────── 1 ▸ Scoring engine (mirrors prompt) ───────── */
-function helperScores(r){
-  const A=r.dataA, B=r.dataB, C=r.dataC, D=r.dataD, E=r.dataE, F=r.dataF, G=r.dataG, H=r.dataH;
-  const safe=v=>(v===undefined||v===null||Number.isNaN(v))?0:+v;
+/* ───────── 1 ▸ quality-score engine ---------------------------------------------- */
 
-  const price = safe(F.price);
+/* per-factor weights (align, momentum, crowd, structure, risk) */
+const WEIGHTS={
+  default:[1,1,1,1,1],
+  1:[1.0,1.0,1.0,1.2,0.8],
+  2:[1.0,1.0,1.0,1.2,0.8],
+  3:[0.7,1.0,1.5,0.6,1.2],
+  4:[0.8,1.0,1.3,0.7,1.2],
+  5:[1.0,1.0,1.2,0.9,0.9],
+  6:[0.9,1.1,1.0,1.0,1.0],
+  7:[0.9,1.2,1.1,0.8,1.0],
+  8:[1.0,1.0,1.3,1.0,0.7],
+  9:[1.0,1.2,1.2,0.9,0.7]
+};
 
-  /* Momentum */
-  const trend15 = Math.sign(safe(A["15m"].ema50) - safe(A["15m"].ema200));
-  const trend1h = Math.sign(safe(A["1h"].ema50)  - safe(A["1h"].ema200));
-  const trend4h = Math.sign(safe(A["4h"].ema50)  - safe(A["4h"].ema200));
-  const rsi1h   = safe(A["1h"].rsi14)>65?1: safe(A["1h"].rsi14)<35?-1:0;
+/* minimal gates */
+const MIN_GATE={1:6,2:6,3:5,4:5,5:6,6:5,7:5,8:5,9:5};
 
-  /* Velocity (ATR adaptive) */
-  const atrPct = safe(A["15m"].atrPct);
-  const roc10  = safe(C["15m"].roc10)>= 0.4*atrPct ? 1 :
-                 safe(C["15m"].roc10)<=-0.4*atrPct ? -1 : 0;
-  const roc20  = safe(C["15m"].roc20)>= 0.8*atrPct ? 1 :
-                 safe(C["15m"].roc20)<=-0.8*atrPct ? -1 : 0;
+/* tiered catalyst bonuses (+0/+1/+2) */
+function playBonus(p,d){
+  const liq=d.dataB.liquidations||{};
+  const liq1h=Math.max($(liq.long1h),$(liq.short1h));
+  const bandW= (()=>{ const up=$(d.dataF.levels?.vwapUpper), vw=$(d.dataF.levels?.vwap);
+                      return (up&&vw)?pct(up,vw):null; })();
+  const neckBreak=d.dataF.neckBreak;
 
-  /* Volume & crowd */
-  const volRel15   = {"very high":2,"high":1,"normal":0,"low":-1}[D.relative["15m"]] ?? 0;
-  const fundingBias= safe(B.fundingZ)<=-0.5 ? 1 : safe(B.fundingZ)>=0.5 ? -1 : 0;
-  const oiShift    = safe(B.oiDelta24h)>=2 ? 1 : safe(B.oiDelta24h)<=-2 ? -1 : 0;
-  const stressFlag = E ? (E.stressIndex>=7?2:E.stressIndex>=5?1:0) : 0;
+  switch(p.id){
+    case 2:  // AVWAP reclaim
+      if(neckBreak){
+        if(bandW!==null && bandW<=1.5) return 2;
+        return 1;
+      }
+      return 0;
+    case 4:  // Liq-Sweep
+      if(liq1h>=80e6 || neckBreak) return 2;
+      if(liq1h>=40e6) return 1;
+      return 0;
+    case 8:  // VWAP fade
+      if(neckBreak){
+        if(bandW!==null && bandW<=1.5) return 2;
+        if(bandW!==null && bandW<=2.5) return 1;
+      }
+      return 0;
+    default: return 0;
+  }
+}
 
-  const liq   = B.liquidations||{};
-  const liqImb= (safe(liq.long1h)+safe(liq.long4h))-(safe(liq.short1h)+safe(liq.short4h));
-  const liqBiasThreshold = 600_000;                           // ETH‑tuned
-  const liqBias = Math.abs(liqImb)>liqBiasThreshold ? Math.sign(liqImb) : 0;
+/* compute five sub-factors, apply play-weights, add bonus, return 1-10 */
+function computeQualityScore(d,play){
+  const price=$(d.dataF.price);
 
-  /* Structure */
-  const poc     = F.vpvr?.["1d"]?.poc || 0;
-  const pocDir  = Math.abs(price-poc) >= 0.002*price ? Math.sign(price-poc) : 0;
-
-  /* Macro & sentiment */
-  const macroDir  = G ? (safe(G.mcap24hPct)>=1?1:safe(G.mcap24hPct)<=-1?-1:0) : 0;
-  const fgVal     = parseInt((H?.fearGreed||"50").split(" ")[0],10);
-  const sentiment = fgVal>60?1: fgVal<40?-1:0;
-
-  return {
-    price, atrPct,
-    trend15, trend1h, trend4h, rsi1h,
-    roc10, roc20,
-    volRel15, fundingBias, oiShift,
-    stressFlag, liqBias,
-    pocDir, macroDir, sentiment
+  /* 1 ▸ Alignment */
+  const sign = v=>v>0?1:-1;
+  const tSign = tf=>{
+    const ema50=$(d.dataA[tf].ema50);
+    return sign(price-ema50);
   };
+  const a15=tSign("15m"), a1h=tSign("1h"), a4h=tSign("4h");
+  const align = (a15===a1h && a1h===a4h)?2 : (a15===a1h||a15===a4h||a1h===a4h)?1:0;
+
+  /* 2 ▸ Momentum impulse */
+  const roc10=$(d.dataC["15m"].roc10), roc20=$(d.dataC["15m"].roc20);
+  const atrPct15=$(d.dataA["15m"].atrPct);
+  const impulse = Math.max(Math.abs(roc10),Math.abs(roc20));
+  const momentum = impulse >= atrPct15*2 ? 2 : impulse >= atrPct15 ? 1 : 0;
+
+  /* 3 ▸ Liquidity & crowd */
+  const relVol=d.dataD.relative["15m"]; const volHigh=relVol==="high"||relVol==="very high";
+  const fundingZ=parseFloat(d.dataB.fundingZ); const fundOpp = play.dir==="LONG"? fundingZ<0: fundingZ>0;
+  const liq=d.dataB.liquidations||{};
+  const liqBias = play.dir==="LONG"? $(liq.short1h)>$(liq.long1h) : $(liq.long1h)>$(liq.short1h);
+  const crowd = (volHigh && fundOpp && liqBias)?2 : ((volHigh&&fundOpp)||(fundOpp&&liqBias)||(volHigh&&liqBias))?1:0;
+
+  /* 4 ▸ Structure confluence */
+  const vwap=$(d.dataF.levels?.vwap); const poc=$(d.dataF.vpvr?.["4h"]?.poc); const neck=$(d.dataF.neckline);
+  let confl=0;
+  const near = lvl=>lvl && Math.abs(price-lvl)/price*100<=0.7;
+  if(near(vwap)) confl++;
+  if(near(poc))  confl++;
+  if(neck && near(neck)) confl++;
+  const structure = confl>=2?2:confl>=1?1:0;
+
+  /* 5 ▸ Risk backdrop */
+  const stress=$(d.dataE.stressIndex);
+  const risk = stress<3?2:stress<5?1:0;
+
+  const rawFactors=[align,momentum,crowd,structure,risk];
+
+  /* weighting & scaling */
+  const w = WEIGHTS[play.id] || WEIGHTS.default;
+  const weighted = rawFactors.reduce((s,v,i)=>s+v*w[i],0);
+  const maxRaw   = w.reduce((s,x)=>s+x,0)*2;
+  let score = Math.round((weighted/maxRaw)*10);
+
+  /* catalyst bonus */
+  score = Math.min(10, score + playBonus(play,d));
+
+  return score;
 }
 
-function consensus(s){
-  const fast  = s.trend15+s.rsi1h+s.roc10+s.volRel15+s.fundingBias+s.liqBias+s.pocDir;
-  const swing = s.trend1h+s.trend4h+s.roc20+s.oiShift+s.macroDir+s.stressFlag;
-  let dir="FLAT", conv="Low";
-  if(fast>=4 || swing>=5){        dir="LONG";  conv="High"; }
-  else if(fast<=-4||swing<=-5){   dir="SHORT"; conv="High"; }
-  else if(fast>=2||swing>=3){     dir="LONG";  conv="Medium"; }
-  else if(fast<=-2||swing<=-3){   dir="SHORT"; conv="Medium"; }
-  return { dir, conv, fast, swing };
+/* ───────── 2 ▸ play generator ------------------------------------------------------ */
+function detectPlays(d){
+  const plays=[], price=$(d.dataF.price);
+  const distOK =(lvl,p=5)=>lvl&&Math.abs(lvl-price)/price*100<=p;
+
+  /* existing rule-set (unchanged thresholds) … */
+  /* ------------------------------------------------ Play #1 HH20 Break-Retest */
+  const HH20=$(d.dataF.levels?.HH20);
+  if(distOK(HH20)&&price>HH20*1.001){
+    plays.push({id:1,dir:"LONG",name:"Break-Retest",
+      entry:[HH20*1.0005,HH20*1.0015],stop:HH20*0.992,tp1:HH20*1.015,lev:[5,15]});
+  }
+
+  /* ------------------------------------------------ Play #2 AVWAP Reclaim */
+  const avwap=$(d.dataF.avwapCycle);
+  const avAge=(Date.now()-$(d.dataF.avwapAnchorTs||0))/864e5;
+  if(distOK(avwap)&&avAge<=30&&price>avwap*1.001){
+    const atr4=$(d.dataA["4h"].atrPct)/100;
+    plays.push({id:2,dir:"LONG",name:"AVWAP Reclaim",
+      entry:[avwap,avwap*1.001],stop:avwap*(1-atr4),tp1:price*1.015,lev:[3,8]});
+  }
+
+  /* ------------------------------------------------ Play #3 Funding Fade */
+  const fundingZ=parseFloat(d.dataB.fundingZ);
+  if(Math.abs(fundingZ)>=2){
+    const dir=fundingZ>0?"SHORT":"LONG",s=dir==="LONG"?1:-1;
+    plays.push({id:3,dir,name:"Funding Fade",
+      entry:[price],stop:price*(1-s*0.006),tp1:price*(1+s*0.0075),lev:[5,15]});
+  }
+
+  /* ------------------------------------------------ Play #4 Liq-Sweep */
+  const liq=d.dataB.liquidations||{};
+  const bigLiq=Math.max($(liq.long1h),$(liq.short1h));
+  const atr15=$(d.dataA["15m"].atrPct);
+  if(bigLiq>=25e6&&atr15<=1.5){
+    const dir=$(liq.short1h)>$(liq.long1h)?"LONG":"SHORT",s=dir==="LONG"?1:-1;
+    plays.push({id:4,dir,name:"Liq-Sweep",
+      entry:[price-price*0.0003*s],stop:price-price*0.004*s,tp1:price+price*0.004*s,lev:[10,50]});
+  }
+
+  /* ------------------------------------------------ Play #5 High-OI Squeeze */
+  const oiPct=$(d.dataB.oi30dPct), oiΔ=$(d.dataB.oiDelta24h);
+  if(oiPct>=95&&Math.abs(oiΔ)<=2){
+    plays.push({id:5,dir:"BREAK",name:"High-OI Box",
+      entry:[price],stop:price*0.982,tp1:price*1.04,lev:[5,15]});
+  }
+
+  /* ------------------------------------------------ Play #6 EMA Pull-back */
+  const adx14=$(d.dataA["4h"].adx14);
+  if(adx14>20&&d.dataA["1d"].ema50>d.dataA["1d"].ema200&&price<d.dataA["4h"].ema50){
+    const ema=d.dataA["4h"].ema50;
+    plays.push({id:6,dir:"LONG",name:"EMA Pull-back",
+      entry:[ema*0.999],stop:ema*0.99,tp1:price*1.02,lev:[3,10]});
+  }
+
+  /* ------------------------------------------------ Play #7 Opening-Range */
+  const now=new Date();
+  if(now.getUTCMinutes()===20&&atr15<0.5&&d.dataD.sessionRelVol?.asia>1.2){
+    plays.push({id:7,dir:"BREAK",name:"Opening-Range",
+      entry:[price],stop:price*(1-atr15/100),tp1:price*(1+atr15/200),lev:[10,25]});
+  }
+
+  /* ------------------------------------------------ Play #8 VWAP Fade */
+  const vwap=$(d.dataF.levels?.vwap),
+        up=$(d.dataF.levels?.vwapUpper),
+        lo=$(d.dataF.levels?.vwapLower),
+        bandW=(up&&vwap)?pct(up,vwap):null;
+  if(bandW&&bandW<3){
+    if(up&&price>up&&distOK(up,3)){
+      plays.push({id:8,dir:"SHORT",name:"VWAP Fade",
+        entry:[price],stop:price*1.007,tp1:vwap,lev:[5,20]});
+    }
+    if(lo&&price<lo&&distOK(lo,3)){
+      plays.push({id:8,dir:"LONG",name:"VWAP Fade",
+        entry:[price],stop:price*0.993,tp1:vwap,lev:[5,20]});
+    }
+  }
+
+  /* ------------------------------------------------ Play #9 Session Kick */
+  const roc1h=$(d.dataC["1h"].roc10), ses=d.dataD.sessionRelVol||{};
+  const hr=now.getUTCHours();
+  if((hr===8||hr===14)&&Math.abs(roc1h)>=0.4&&(ses.asia>1.5||ses.eu>1.5)){
+    const dir=roc1h>0?"LONG":"SHORT",s=dir==="LONG"?1:-1;
+    plays.push({id:9,dir,name:"Session Kick",
+      entry:[price],stop:price*(1-s*0.004),tp1:price*(1+s*0.01),lev:[5,15]});
+  }
+
+  /* ---- score & gate pass ------------------------------------------------ */
+  const final=[];
+  for(const p of plays){
+    const q = computeQualityScore(d,p);
+    const gate = MIN_GATE[p.id]||5;
+    p.quality = q;
+    p.belowGate = q < gate;
+    if(p.belowGate) dbg(`Play #${p.id} scored ${q} < gate ${gate} (will tag as informational)`);
+    final.push(p);                            // always keep, even if below gate
+  }
+  return final;
 }
 
-/* traffic‑light icons */
-const light=v=>v>0?"🟢":v<0?"🔴":"🟡";
-function blockLights(s){
-  return [
-    light(s.trend15+s.trend1h),        // A Trend
-    light(s.fundingBias+s.oiShift),    // B Derivatives
-    light(s.roc10+s.roc20),            // C Velocity
-    light(s.volRel15),                 // D Volume
-    light(-s.stressFlag),              // E Stress (inverse)
-    light(s.pocDir),                   // F Structure
-    light(s.macroDir),                 // G Macro
-    light(s.sentiment)                 // H Sentiment
-  ].join("");
+/* quick one-liner */
+const playLine = p =>
+  `• #${p.id} (${p.quality}/10${p.belowGate?"⤓":""}) ${p.name} ${p.dir} @${fmt$(p.entry[0])}${p.entry[1]?`-${fmt$(p.entry[1])}`:""} SL:${fmt$(p.stop)}`;
+
+/* ───────── 3 ▸ HTML builder -------------------------------------------------------- */
+function buildMsg(p,d){
+  const snap=
+`• FundingZ <b>${esc(d.dataB.fundingZ)}</b> | OI30d <b>${esc(d.dataB.oi30dPct)}%</b>
+• ADX 4h <b>${esc(d.dataA["4h"].adx14)}</b> | Stress <b>${esc(d.dataE.stressIndex)}</b>
+• EU vol <b>${esc(d.dataD.sessionRelVol.eu)}</b> | 15 m vol <b>${esc(d.dataD.relative["15m"])}</b>`;
+
+  const swings = d.dataF.swings?.H1!==null
+    ? `\nSwings ➜ H1 ${fmt$(d.dataF.swings.H1)} • H2 ${fmt$(d.dataF.swings.H2)} • neckline ${fmt$(d.dataF.neckline)} (broken? ${d.dataF.neckBreak?"yes":"no"})`
+    : "";
+
+  const posUsd=(riskPc/100*10_000)*p.lev[1]/Math.abs(p.entry[0]-p.stop);
+  const ts=new Date().toLocaleString("en-GB",{timeZone:"Europe/Paris",hour12:false});
+  const icon=p.dir==="LONG"?"🟢":"🔴";
+
+  const warn = p.belowGate ? "\n⚠️ <b>Below quality gate – informational only</b>" : "";
+
+  return `${icon} <b>ETH PERP | Play #${p.id} – ${p.name}</b>
+<i>${esc(ts)}</i>
+
+<b>Direction:</b> ${p.dir}
+<b>Entry zone:</b> ${p.entry.map(v=>fmt$(v)).join(" – ")}
+<b>Stop-loss:</b> ${fmt$(p.stop)}
+<b>TP 1:</b> ${fmt$(p.tp1)}
+<b>Leverage:</b> ${p.lev[0]}× – ${p.lev[1]}×
+<b>Quality:</b> ${p.quality}/10${p.belowGate?" (sub-gate)":""}
+<b>Risk:</b> ${riskPc}% → pos ≈ ${fmt(posUsd,1)} USD
+
+${snap}${swings}${warn}
+
+<b>Plan</b>
+Enter within zone; abort if unfilled in 90 min or opposite trigger forms.
+
+#ETH #Play${p.id}`;
 }
 
-/* ───────── 2 ▸ Main routine ───────── */
+/* ───────── 4 ▸ main --------------------------------------------------------------- */
 (async()=>{
   try{
-    /* fetch dashboard (pass symbol) */
-    const url = `${LIVE}?symbol=${SYMBOL}`;
-    const res = await fetch(url,{agent,timeout:20000});
-    if(!res.ok) throw new Error(`LIVE ${res.status}`);
-    const raw = await res.json();
+    const dash = await safeJson(LIVE);
 
-    /* compute scores & decision */
-    const scores = helperScores(raw);
-    const sig    = consensus(scores);
+    const price = $(dash.dataF.price);
+    const HH20  = $(dash.dataF.levels?.HH20);
+    const avwap = $(dash.dataF.avwapCycle);
+    const fundingZ= parseFloat(dash.dataB.fundingZ);
+    const bigLiq  = Math.max($(dash.dataB.liquidations?.long1h),$(dash.dataB.liquidations?.short1h));
 
-    /* audit log – always */
-    console.log("=== helperScores ===");
-    console.log(JSON.stringify(scores, null, 2));
-    console.log("=== consensus ===");
-    console.log(JSON.stringify(sig, null, 2));
+    const plays = detectPlays(dash);
 
-    /* prettier table when DEBUG */
-    if(DEBUG){ console.table(scores); }
-
-    /* only High‑conviction */
-    if(sig.conv!=="High"){
-      console.log("Not High conviction – skipping alert."); return;
+    /* audit */
+    const idList=plays.map(p=>`${p.id}(${p.quality})`).join(",")||"none";
+    console.log(`ALERT SUMMARY | price=${fmt$(price)}  ${HH20?`HH20Δ=${pct(price,HH20).toFixed(2)}%  `:""}${avwap?`AVWAPΔ=${pct(price,avwap).toFixed(2)}%  `:""}fundingZ=${fundingZ}  bigLiq=$${fmt(bigLiq/1e6,0)}M  plays=[${idList}]`);
+    plays.forEach(p=>console.log(playLine(p)));
+    if(isDbg){
+      console.log("===== TRACE =====");
+      console.log(LOG.join("\n"));
+      console.log("=================");
     }
 
-    /* 60‑minute spam guard */
-    const cacheFile = `/tmp/last_alert_${SYMBOL}.json`;
-    let last={ts:0};
-    try{ last=JSON.parse(fs.readFileSync(cacheFile,"utf8")); }catch{}
-    if(!DEBUG && Date.now()-last.ts<3_600_000){
-      console.log("Muted: last alert <60 min ago."); return;
+    if(!plays.length) return;
+
+    /* mute window */
+    const cache="/tmp/alert_cache.json";
+    let last={ts:0}; try{ last=JSON.parse(fs.readFileSync(cache,"utf8")); }catch{}
+    if(!isDbg && Date.now()-last.ts<3_600_000){
+      console.log("Muted 60-min window"); return;
     }
 
-    /* build Telegram message */
-    const cet     = new Date().toLocaleString("en-GB",{timeZone:"Europe/Paris",hour12:false});
-    const message =
-`Signal Block | ${ASSET}/USD | Time: ${cet}
-*Current Price* ${fmt$(scores.price)}
-🚀 *${sig.dir}* (High conviction)
-🚦 Block Biases: ${blockLights(scores)}
-
-🧩 Consensus
-• Fast ${sig.fast}  • Swing ${sig.swing}`;
-
-    /* send & update mute cache */
-    await tg(message);
-    fs.writeFileSync(cacheFile, JSON.stringify({ ts: Date.now() }));
-    console.log("✅ Telegram alert sent.");
+    for(const p of plays) await tg(buildMsg(p,dash));
+    fs.writeFileSync(cache,JSON.stringify({ts:Date.now()}));
+    console.log(`✅ Sent ${plays.length} alert(s)`);
 
   }catch(err){
-    console.error("❌ Script error:", err);
-    try{ await tg(`⚠️ Alert script error: ${err.message}`);}catch{}
+    console.error("❌",err);
+    try{ await tg(esc(`Bot error: ${err.message}`)); }catch{}
     process.exit(1);
   }
 })();
