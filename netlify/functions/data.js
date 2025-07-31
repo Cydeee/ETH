@@ -102,7 +102,7 @@ async function buildDashboardData() {
 
   /* C – ROC (unchanged) */
   for (const tf of ["15m","1h","4h","1d"]) {
-    try{
+    try {
       const kl = await safeJson(`https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=${tf}&limit=21`);
       const c = kl.map(r=>+r[4]);
       out.dataC[tf] = { roc10:+roc(c,10).toFixed(2), roc20:+roc(c,20).toFixed(2) };
@@ -159,7 +159,7 @@ async function buildDashboardData() {
     };
   } catch(e){ out.dataE=null; out.errors.push(`E: ${e.message}`); }
 
-  /* F – VPVR, Levels, Live Price, swing detection (unchanged) */
+  /* F – VPVR, Levels, Live Price, swing detection */
   try {
     const h4 = await safeJson(`https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=4h&limit=96`);
     const d1 = await safeJson(`https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=1d&limit=60`);
@@ -182,7 +182,7 @@ async function buildDashboardData() {
       price:+currentPx.toFixed(2)
     };
 
-    /* cycle-anchored VWAP (anchor = lowest weekly close in last 52 weeks) */
+    /* cycle-anchored VWAP */
     const closes = w1.map(r=>+r[4]), lows52=closes.slice(-52);
     const idx = lows52.indexOf(Math.min(...lows52));
     const anchorTs = +w1[w1.length-52+idx][0];
