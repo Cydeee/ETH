@@ -459,4 +459,161 @@ async function buildDashboardData () {
 
             const projToday = slope * endIdx + intercept;
             if (!best) {
-              best = { slope, inte
+              best = { slope, intercept, score: projToday };
+            } else if (side === "high" ? (projToday < best.score) : (projToday > best.score)) {
+              best = { slope, intercept, score: projToday };
+            }
+          }
+        }
+        if (!best) return null;
+        return {
+          slope: +best.slope.toFixed(6),
+          intercept: +best.intercept.toFixed(2)
+        };
+      };
+
+      let dominantUpperSwingEnvelope30d = pickEnvelopeLine(swingHighs30, "high");
+      let dominantLowerSwingEnvelope30d = pickEnvelopeLine(swingLows30,  "low");
+
+      // Fallback: if envelope not found, use 2 most recent confirmed swings
+      const fallbackLine = (arr)=>{
+        if (arr && arr.length >= 2) {
+          const A = arr[arr.length-2], B = arr[arr.length-1];
+          if (B.idx !== A.idx) {
+            const slope = (B.price - A.price) / (B.idx - A.idx);
+            const intercept = A.price - slope * A.idx;
+            return { slope:+slope.toFixed(6), intercept:+intercept.toFixed(2) };
+          }
+        }
+        return null;
+      };
+      if (!dominantUpperSwingEnvelope30d) dominantUpperSwingEnvelope30d = fallbackLine(swingHighs30);
+      if (!dominantLowerSwingEnvelope30d) dominantLowerSwingEnvelope30d = fallbackLine(swingLows30);
+
+      // --- Compute today's projected prices for those lines (resistance/support)
+      const upperResistancePriceToday30d =
+        dominantUpperSwingEnvelope30d
+          ? +(clampNum(dominantUpperSwingEnvelope30d.slope * (len-1) + dominantUpperSwingEnvelope30d.intercept).toFixed(2))
+          : null;
+      const lowerSupportPriceToday30d =
+        dominantLowerSwingEnvelope30d
+          ? +(clampNum(dominantLowerSwingEnvelope30d.slope * (len-1) + dominantLowerSwingEnvelope30d.intercept).toFixed(2))
+          : null;
+
+      // EMAs (4h and 1d) with explicit names (and keep old aliases)
+      const closes4h = bars4h.map(r=>+r[4]);
+      const ema4hPeriod20  = ema(closes4h,20)  || 0;
+      const ema4hPeriod50  = ema(closes4h,50)  || 0;
+      const ema4hPeriod200 = ema(closes4h,200) || 0;
+
+      const ema1dPeriod20  = ema(closes1d,20)  || 0;
+      const ema1dPeriod50  = ema(closes1d,50)  || 0;
+      const ema1dPeriod200 = ema(closes1d,200) || 0;
+
+      // Final levels object (self-explanatory + backward-compat aliases)
+      const levels = {
+        // Pivots
+        dailyPivot:  +pivot.toFixed(2),
+        dailyR1:     +R1.toFixed(2),
+        dailyS1:     +S1.toFixed(2),
+
+        // High/Low last 20h (and aliases)
+        highestHighLast20h: +highestHighLast20h.toFixed(2),
+        lowestLowLast20h:   +lowestLowLast20h.toFixed(2),
+        HH20: +highestHighLast20h.toFixed(2), // alias
+        LL20: +lowestLowLast20h.toFixed(2),   // alias
+
+        // Session VWAP (UTC day) and bands (1σ, 1.5σ, 2σ)
+        sessionVwap: +sessionVwap.toFixed(2),
+        sessionVwapBand1Upper:   sessionVwapBand1Upper,
+        sessionVwapBand1Lower:   sessionVwapBand1Lower,
+        sessionVwapBand1_5Upper: sessionVwapBand1_5Upper,
+        sessionVwapBand1_5Lower: sessionVwapBand1_5Lower,
+        sessionVwapBand2Upper:   sessionVwapBand2Upper,
+        sessionVwapBand2Lower:   sessionVwapBand2Lower,
+
+        // Legacy aliases (map to 1σ)
+        vwap:       +sessionVwap.toFixed(2),
+        vwapUpper:  sessionVwapBand1Upper,
+        vwapLower:  sessionVwapBand1Lower,
+
+        // Weekly VWAP (UTC week starting Monday 00:00) and bands
+        weeklyVwap: +weeklyVwap.toFixed(2),
+        weeklyVwapBand1Upper:   weeklyVwapBand1Upper,
+        weeklyVwapBand1Lower:   weeklyVwapBand1Lower,
+        weeklyVwapBand1_5Upper: weeklyVwapBand1_5Upper,
+        weeklyVwapBand1_5Lower: weeklyVwapBand1_5Lower,
+        weeklyVwapBand2Upper:   weeklyVwapBand2Upper,
+        weeklyVwapBand2Lower:   weeklyVwapBand2Lower,
+
+        // Rolling highs/lows
+        rolling7dHigh:  +rolling7dHigh.toFixed(2),
+        rolling7dLow:   +rolling7dLow.toFixed(2),
+        rolling30dHigh: +rolling30dHigh.toFixed(2),
+        rolling30dLow:  +rolling30dLow.toFixed(2),
+
+        // Horizontal swings with clear names (+ aliases)
+        lastConfirmedSwingHigh30d: lastConfirmedSwingHigh30d != null ? +lastConfirmedSwingHigh30d.toFixed(2) : null,
+        lastConfirmedSwingLow30d:  lastConfirmedSwingLow30d  != null ? +lastConfirmedSwingLow30d.toFixed(2)  : null,
+        rolling30dSwingHigh: lastConfirmedSwingHigh30d != null ? +lastConfirmedSwingHigh30d.toFixed(2) : null, // alias
+        rolling30dSwingLow:  lastConfirmedSwingLow30d  != null ? +lastConfirmedSwingLow30d.toFixed(2)  : null, // alias
+
+        // Sloping swing ENVELOPE lines (equations) + current projected prices
+        dominantUpperSwingEnvelope30d: dominantUpperSwingEnvelope30d || null,
+        dominantLowerSwingEnvelope30d: dominantLowerSwingEnvelope30d || null,
+        // current projected resistance/support from those lines (today)
+        upperResistancePriceToday30d: upperResistancePriceToday30d,
+        lowerSupportPriceToday30d:    lowerSupportPriceToday30d,
+
+        // Back-compat aliases for lines:
+        rolling30dSwingHighLine: dominantUpperSwingEnvelope30d || null,
+        rolling30dSwingLowLine:  dominantLowerSwingEnvelope30d || null,
+
+        // EMAs with explicit names (+ aliases)
+        ema4hPeriod20:  ema4hPeriod20 ? +ema4hPeriod20.toFixed(2) : null,
+        ema4hPeriod50:  ema4hPeriod50 ? +ema4hPeriod50.toFixed(2) : null,
+        ema4hPeriod200: ema4hPeriod200 ? +ema4hPeriod200.toFixed(2) : null,
+        ema1dPeriod20:  ema1dPeriod20 ? +ema1dPeriod20.toFixed(2) : null,
+        ema1dPeriod50:  ema1dPeriod50 ? +ema1dPeriod50.toFixed(2) : null,
+        ema1dPeriod200: ema1dPeriod200 ? +ema1dPeriod200.toFixed(2) : null,
+        // aliases:
+        ema4h20:  ema4hPeriod20 ? +ema4hPeriod20.toFixed(2) : null,
+        ema4h50:  ema4hPeriod50 ? +ema4hPeriod50.toFixed(2) : null,
+        ema4h200: ema4hPeriod200 ? +ema4hPeriod200.toFixed(2) : null,
+        ema1d20:  ema1dPeriod20 ? +ema1dPeriod20.toFixed(2) : null,
+        ema1d50:  ema1dPeriod50 ? +ema1dPeriod50.toFixed(2) : null,
+        ema1d200: ema1dPeriod200 ? +ema1dPeriod200.toFixed(2) : null
+      };
+
+      result.dataF.levels = levels;
+    }
+  } catch(e) {
+    result.errors.push("F: "+e.message);
+  }
+
+  /* BLOCK G --------------------------------------------------------------- */
+  try{
+    const gv=await safeJson("https://api.coingecko.com/api/v3/global");
+    const d=(gv&&gv.data)?gv.data:{ total_market_cap:{usd:0}, market_cap_change_percentage_24h_usd:0, market_cap_percentage:{btc:0,eth:0} };
+    result.dataG={
+      totalMcapT:+((d.total_market_cap.usd||0)/1e12).toFixed(2),
+      mcap24hPct:+(d.market_cap_change_percentage_24h_usd||0).toFixed(2),
+      btcDominance:+(d.market_cap_percentage.btc||0).toFixed(2),
+      ethDominance:+(d.market_cap_percentage.eth||0).toFixed(2)
+    };
+  }catch(e){
+    result.errors.push("G: "+e.message);
+  }
+
+  /* BLOCK H --------------------------------------------------------------- */
+  try{
+    const fg=await safeJson("https://api.alternative.me/fng/?limit=1");
+    const row=(fg && fg.data && fg.data[0]) ? fg.data[0] : null;
+    if(!row) throw new Error("FNG missing");
+    result.dataH={fearGreed:`${row.value} · ${row.value_classification}`};
+  }catch(e){
+    result.errors.push("H: "+e.message);
+  }
+
+  return result;
+}
