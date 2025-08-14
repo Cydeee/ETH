@@ -1,13 +1,16 @@
 // netlify/edge-functions/edge-data.js
 // Blocks: A indicators | B derivatives+liquidations | C ROC | D volume+CVD
 //         E stress | F structure+VPVR+price | G macro | H sentiment
-// Updates in F:
-// - Session VWAP (UTC day) bands at 1σ, 1.5σ, 2σ, with legacy aliases (vwap, vwapUpper, vwapLower -> 1σ)
-// - Weekly VWAP (UTC week anchored Monday 00:00) bands at 1σ, 1.5σ, 2σ
-// - Sloping swing ENVELOPE lines (upper/lower) that contain (almost) all bars over last 30d,
-//   plus CURRENT projected resistance/support price from these lines
-// - Rolling highs/lows, horizontal swings, 4h/1d EMAs
-// - Safer fetch for VWAP (pagination for 1m so we don't clip at 1000 bars)
+// Structure updates:
+// - Swing window: 60d
+// - Add "last-two-swings" trendlines (top/bottom) + today's projected prices
+// - Keep "envelope" (containment) lines, now 60d as well
+// VWAP updates:
+// - Session VWAP (UTC day) ±1σ/±1.5σ/±2σ (aliases vwap/vwapUpper/vwapLower = 1σ)
+// - Weekly VWAP (UTC week from Monday 00:00) ±1σ/±1.5σ/±2σ
+// Other:
+// - Clear naming + backward-compat aliases
+// - Fix small URL typo in Block C
 
 export const config = { path: ["/data", "/data.json"], cache: "manual" };
 
@@ -61,14 +64,19 @@ async function buildDashboardData () {
   const SYMBOL = "ETHUSDT";
   const LIMIT  = 250;
 
-  // ---- Tunables for sloping swing envelope lines ------------------------
-  const SWING_LOOKBACK_DAYS   = 30;     // window for structure lines
-  const SWING_FRACTAL_N       = 2;      // swing confirmation (fractal)
-  const SWING_MIN_RECENT_BARS = 7;      // ≥1 anchor within last X days
-  const SWING_TOLERANCE_PCT   = 0.004;  // 0.4% tolerance for wicks
-  const SWING_MAX_VIOLATIONS  = 1;      // allow up to N bars to pierce line
-  const SLOPE_MIN_USD_PER_DAY = 0.02;   // near-horizontal filter
-  const SLOPE_MAX_USD_PER_DAY = 800;    // absurdly steep filter
+  // ---- Tunables ----------------------------------------------------------
+  // Swing structure
+  const SWING_LOOKBACK_DAYS   = 60;      // main structure window for trendlines
+  const SWING_FRACTAL_N       = 2;       // swing confirmation (fractal n)
+  const SWING_MIN_RECENT_BARS = 7;       // ≥1 anchor in last X days for envelopes
+  const SWING_TOLERANCE_PCT   = 0.006;   // 0.6% wick tolerance
+  const SWING_MAX_VIOLATIONS  = 2;       // allowed pierces for envelopes
+  const SLOPE_MIN_USD_PER_DAY = 0.02;    // line slope bounds
+  const SLOPE_MAX_USD_PER_DAY = 800;
+
+  // "Last-two-swings" selection guards
+  const L2_MIN_GAP_BARS       = 5;       // min bar gap between anchors
+  const L2_MIN_DELTA_PCT      = 0.02;    // ≥2% move between anchors
   // -----------------------------------------------------------------------
 
   const result = {
@@ -82,7 +90,7 @@ async function buildDashboardData () {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     return r.json();
   };
-  const sma = (a,p)=> a.slice(a.length - p).reduce((s,x)=>s+x,0)/p;
+  const sma = (a,p)=> a.slice(Math.max(0, a.length - p)).reduce((s,x)=>s+x,0)/p;
   const ema = (a,p)=> {
     if (a.length < p) return 0;
     const k = 2/(p+1);
@@ -112,7 +120,6 @@ async function buildDashboardData () {
   };
   const roc=(a,n)=> a.length>=n+1 ? ((a[a.length-1]-a[a.length-(n+1)])/a[a.length-(n+1)])*100 : 0;
 
-  // small utils
   const clampNum = v => (Number.isFinite(v) ? v : 0);
 
   // Wilder ADX
@@ -142,7 +149,7 @@ async function buildDashboardData () {
             d=Math.abs(plusDI-minusDI)/(plusDI+minusDI||1)*100;
       dx.push(d);
     }
-    return +sma(dx.slice(dx.length - p),p).toFixed(2);
+    return +sma(dx.slice(Math.max(0, dx.length - p)),p).toFixed(2);
   };
 
   // --- Kline pagination for full-range VWAPs ---
@@ -155,7 +162,6 @@ async function buildDashboardData () {
     const res = [];
     const step = INTERVAL_MS[interval] || 60000;
     let from = startTime;
-    // Binance max 1000 per request
     for (let guard=0; guard<50 && from < endTime; guard++){
       const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&startTime=${from}&endTime=${endTime}&limit=1000`;
       const chunk = await safeJson(url);
@@ -226,7 +232,8 @@ async function buildDashboardData () {
   /* BLOCK C --------------------------------------------------------------- */
   for(const tf of ["15m","1h","4h","1d"]){
     try{
-      const kl=await safeJson(`https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=${tf}&limit=21}`);
+      // fixed stray '}' in limit
+      const kl=await safeJson(`https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=${tf}&limit=21`);
       const c=kl.map(r=>+r[4]);
       result.dataC[tf]={roc10:+roc(c,10).toFixed(2), roc20:+roc(c,20).toFixed(2)};
     }catch(e){
@@ -338,7 +345,7 @@ async function buildDashboardData () {
       const highestHighLast20h = Math.max(...h1.map(b=>+b[2]));
       const lowestLowLast20h  = Math.min(...h1.map(b=>+b[3]));
 
-      // --- Session VWAP = midnight UTC → now (paginate 1m safely), bands at 1σ, 1.5σ, 2σ
+      // --- Session VWAP (UTC day) with bands 1σ/1.5σ/2σ
       const midnight = new Date(); midnight.setUTCHours(0,0,0,0);
       const nowTs = Date.now();
       const dayBars = await fetchKlinesPaginated(SYMBOL, "1m", midnight.getTime(), nowTs);
@@ -346,7 +353,7 @@ async function buildDashboardData () {
       for (let i=0;i<dayBars.length;i++){
         const b=dayBars[i];
         const vol = +b[5];
-        const px  = (+b[1]+ +b[2]+ +b[3]+ +b[4]) / 4; // OHLC mean proxy
+        const px  = (+b[1]+ +b[2]+ +b[3]+ +b[4]) / 4;
         vSum += vol;
         pvSum += px * vol;
         pv2   += px * px * vol;
@@ -360,18 +367,17 @@ async function buildDashboardData () {
       const sessionVwapBand2Upper   = +(sessionVwap + 2*sigmaSess).toFixed(2);
       const sessionVwapBand2Lower   = +(sessionVwap - 2*sigmaSess).toFixed(2);
 
-      // --- Weekly VWAP = Monday 00:00 UTC → now (15m bars so <= 1000), bands at 1σ, 1.5σ, 2σ
+      // --- Weekly VWAP (UTC week start Monday 00:00) with bands 1σ/1.5σ/2σ
       const weekStart = new Date(); weekStart.setUTCHours(0,0,0,0);
-      // JS getUTCDay: 0=Sun...6=Sat. We want Monday start:
-      const dow = weekStart.getUTCDay(); // 0..6
-      const daysFromMon = (dow + 6) % 7; // Mon=0, Tue=1, ... Sun=6
+      const dow = weekStart.getUTCDay();           // 0..6 (Sun..Sat)
+      const daysFromMon = (dow + 6) % 7;           // Mon=0
       weekStart.setUTCDate(weekStart.getUTCDate() - daysFromMon);
       const weekBars = await fetchKlinesPaginated(SYMBOL, "15m", weekStart.getTime(), nowTs);
       let vSumW=0, pvSumW=0, pv2W=0;
       for (let i=0;i<weekBars.length;i++){
         const b=weekBars[i];
         const vol = +b[5];
-        const px  = (+b[1]+ +b[2]+ +b[3]+ +b[4]) / 4; // OHLC mean proxy
+        const px  = (+b[1]+ +b[2]+ +b[3]+ +b[4]) / 4;
         vSumW += vol;
         pvSumW += px * vol;
         pv2W   += px * px * vol;
@@ -385,10 +391,12 @@ async function buildDashboardData () {
       const weeklyVwapBand2Upper   = +(weeklyVwap + 2*sigmaWeek).toFixed(2);
       const weeklyVwapBand2Lower   = +(weeklyVwap - 2*sigmaWeek).toFixed(2);
 
-      // Rolling highs/lows from daily bars
+      // Rolling highs/lows from daily bars (unchanged: 7d/30d)
       const highs1d = bars1d.map(r=>+r[2]);
       const lows1d  = bars1d.map(r=>+r[3]);
       const closes1d= bars1d.map(r=>+r[4]);
+      const opens1d = bars1d.map(r=>+r[1]);
+      const times1d = bars1d.map(r=>+r[0]); // timestamps (ms)
       const len = highs1d.length;
       const sliceN = (arr,n)=> arr.length>=n ? arr.slice(arr.length-n) : arr.slice(0);
 
@@ -403,17 +411,17 @@ async function buildDashboardData () {
       for (let i=n; i<len-n; i++){
         const segHigh = Math.max(...highs1d.slice(i-n, i+n+1));
         const segLow  = Math.min(...lows1d.slice(i-n, i+n+1));
-        if (highs1d[i] === segHigh) swingHighs.push({ idx:i, price:highs1d[i] });
-        if (lows1d[i]  === segLow ) swingLows.push({ idx:i, price:lows1d[i]  });
+        if (highs1d[i] === segHigh) swingHighs.push({ idx:i, price:highs1d[i], ts: times1d[i] });
+        if (lows1d[i]  === segLow ) swingLows.push({ idx:i, price:lows1d[i],  ts: times1d[i] });
       }
-      const swingHighs30 = swingHighs.filter(s=>s.idx>=windowStart);
-      const swingLows30  = swingLows.filter(s=>s.idx>=windowStart);
+      const swingHighsW = swingHighs.filter(s=>s.idx>=windowStart);
+      const swingLowsW  = swingLows.filter(s=>s.idx>=windowStart);
 
-      // Horizontal swing levels (most recent confirmed inside 30d) + explanatory names
-      const lastConfirmedSwingHigh30d = swingHighs30.length ? swingHighs30[swingHighs30.length-1].price : null;
-      const lastConfirmedSwingLow30d  = swingLows30.length  ? swingLows30[swingLows30.length-1].price  : null;
+      // Horizontal swing levels (most recent confirmed within 60d)
+      const lastConfirmedSwingHigh60d = swingHighsW.length ? swingHighsW[swingHighsW.length-1].price : null;
+      const lastConfirmedSwingLow60d  = swingLowsW.length  ? swingLowsW[swingLowsW.length-1].price  : null;
 
-      // ---- Envelope builder: tight upper/lower lines that contain (almost) all bars
+      // ---- Envelope builder (containment) across 60d
       const tolerance = SWING_TOLERANCE_PCT;
       const minRecent = len - SWING_MIN_RECENT_BARS;
       const SLOPE_MIN = SLOPE_MIN_USD_PER_DAY;
@@ -427,8 +435,7 @@ async function buildDashboardData () {
         for (let a=0; a<pivots.length-1; a++){
           for (let b=a+1; b<pivots.length; b++){
             const A = pivots[a], B = pivots[b];
-            if (A.idx < windowStart || B.idx < windowStart) continue; // enforce window
-            // Recency: at least one anchor in last X bars
+            if (A.idx < windowStart || B.idx < windowStart) continue;
             if (A.idx < minRecent && B.idx < minRecent) continue;
 
             const slope = (B.price - A.price) / (B.idx - A.idx);
@@ -437,18 +444,15 @@ async function buildDashboardData () {
 
             const intercept = A.price - slope * A.idx;
 
-            // Containment check across window with tolerance and a few allowed violations
             let violations = 0;
             for (let k = windowStart; k <= endIdx; k++){
               const linePrice = slope * k + intercept || 0;
               if (side === "high") {
-                // all highs should be <= line * (1 + tol)
                 if (highs1d[k] > linePrice * (1 + tolerance)) {
                   violations++;
                   if (violations > MAX_VIOLS) break;
                 }
               } else {
-                // all lows should be >= line * (1 - tol)
                 if (lows1d[k] < linePrice * (1 - tolerance)) {
                   violations++;
                   if (violations > MAX_VIOLS) break;
@@ -472,33 +476,49 @@ async function buildDashboardData () {
         };
       };
 
-      let dominantUpperSwingEnvelope30d = pickEnvelopeLine(swingHighs30, "high");
-      let dominantLowerSwingEnvelope30d = pickEnvelopeLine(swingLows30,  "low");
-
-      // Fallback: if envelope not found, use 2 most recent confirmed swings
-      const fallbackLine = (arr)=>{
-        if (arr && arr.length >= 2) {
-          const A = arr[arr.length-2], B = arr[arr.length-1];
-          if (B.idx !== A.idx) {
-            const slope = (B.price - A.price) / (B.idx - A.idx);
-            const intercept = A.price - slope * A.idx;
-            return { slope:+slope.toFixed(6), intercept:+intercept.toFixed(2) };
+      // ---- Last-two-swings trendline (what you'd draw by hand)
+      const pickLastTwoTrendline = (pivots, side /* "high"|"low" */) => {
+        if (!pivots || pivots.length < 2) return null;
+        // pick the last pivot as B, then find previous A satisfying gaps
+        const B = pivots[pivots.length - 1];
+        let A = null;
+        for (let i = pivots.length - 2; i >= 0; i--) {
+          const cand = pivots[i];
+          const gap = B.idx - cand.idx;
+          const deltaPct = Math.abs(B.price - cand.price) / Math.max(cand.price, 1);
+          if (gap >= L2_MIN_GAP_BARS && deltaPct >= L2_MIN_DELTA_PCT) {
+            A = cand;
+            break;
           }
         }
-        return null;
-      };
-      if (!dominantUpperSwingEnvelope30d) dominantUpperSwingEnvelope30d = fallbackLine(swingHighs30);
-      if (!dominantLowerSwingEnvelope30d) dominantLowerSwingEnvelope30d = fallbackLine(swingLows30);
+        if (!A) A = pivots[pivots.length - 2];
+        if (!A || A.idx === B.idx) return null;
 
-      // --- Compute today's projected prices for those lines (resistance/support)
-      const upperResistancePriceToday30d =
-        dominantUpperSwingEnvelope30d
-          ? +(clampNum(dominantUpperSwingEnvelope30d.slope * (len-1) + dominantUpperSwingEnvelope30d.intercept).toFixed(2))
-          : null;
-      const lowerSupportPriceToday30d =
-        dominantLowerSwingEnvelope30d
-          ? +(clampNum(dominantLowerSwingEnvelope30d.slope * (len-1) + dominantLowerSwingEnvelope30d.intercept).toFixed(2))
-          : null;
+        const slope = (B.price - A.price) / (B.idx - A.idx);
+        const intercept = A.price - slope * A.idx;
+        return {
+          slope: +slope.toFixed(6),
+          intercept: +intercept.toFixed(2),
+          anchorIdxA: A.idx, anchorIdxB: B.idx,
+          anchorTsA: A.ts || times1d[A.idx], anchorTsB: B.ts || times1d[B.idx],
+          anchorPriceA: +A.price.toFixed(2), anchorPriceB: +B.price.toFixed(2)
+        };
+      };
+
+      let dominantUpperSwingEnvelope60d = pickEnvelopeLine(swingHighsW, "high");
+      let dominantLowerSwingEnvelope60d = pickEnvelopeLine(swingLowsW,  "low");
+
+      const lastTwoSwingHighTrendline60d = pickLastTwoTrendline(swingHighsW, "high");
+      const lastTwoSwingLowTrendline60d  = pickLastTwoTrendline(swingLowsW,  "low");
+
+      // Today's projected prices
+      const projPrice = (line)=> line ? +(clampNum(line.slope * (len-1) + line.intercept).toFixed(2)) : null;
+
+      const upperResistancePriceToday60d_envelope = projPrice(dominantUpperSwingEnvelope60d);
+      const lowerSupportPriceToday60d_envelope    = projPrice(dominantLowerSwingEnvelope60d);
+
+      const upperResistancePriceToday60d_lastTwo = projPrice(lastTwoSwingHighTrendline60d);
+      const lowerSupportPriceToday60d_lastTwo    = projPrice(lastTwoSwingLowTrendline60d);
 
       // EMAs (4h and 1d) with explicit names (and keep old aliases)
       const closes4h = bars4h.map(r=>+r[4]);
@@ -512,18 +532,18 @@ async function buildDashboardData () {
 
       // Final levels object (self-explanatory + backward-compat aliases)
       const levels = {
-        // Pivots
+        // Pivots (daily)
         dailyPivot:  +pivot.toFixed(2),
         dailyR1:     +R1.toFixed(2),
         dailyS1:     +S1.toFixed(2),
 
-        // High/Low last 20h (and aliases)
+        // High/Low last 20 hours (and aliases)
         highestHighLast20h: +highestHighLast20h.toFixed(2),
         lowestLowLast20h:   +lowestLowLast20h.toFixed(2),
         HH20: +highestHighLast20h.toFixed(2), // alias
         LL20: +lowestLowLast20h.toFixed(2),   // alias
 
-        // Session VWAP (UTC day) and bands (1σ, 1.5σ, 2σ)
+        // Session VWAP (UTC day) ± bands
         sessionVwap: +sessionVwap.toFixed(2),
         sessionVwapBand1Upper:   sessionVwapBand1Upper,
         sessionVwapBand1Lower:   sessionVwapBand1Lower,
@@ -537,7 +557,7 @@ async function buildDashboardData () {
         vwapUpper:  sessionVwapBand1Upper,
         vwapLower:  sessionVwapBand1Lower,
 
-        // Weekly VWAP (UTC week starting Monday 00:00) and bands
+        // Weekly VWAP (UTC week start Monday 00:00) ± bands
         weeklyVwap: +weeklyVwap.toFixed(2),
         weeklyVwapBand1Upper:   weeklyVwapBand1Upper,
         weeklyVwapBand1Lower:   weeklyVwapBand1Lower,
@@ -546,28 +566,31 @@ async function buildDashboardData () {
         weeklyVwapBand2Upper:   weeklyVwapBand2Upper,
         weeklyVwapBand2Lower:   weeklyVwapBand2Lower,
 
-        // Rolling highs/lows
+        // Rolling highs/lows (7d/30d)
         rolling7dHigh:  +rolling7dHigh.toFixed(2),
         rolling7dLow:   +rolling7dLow.toFixed(2),
         rolling30dHigh: +rolling30dHigh.toFixed(2),
         rolling30dLow:  +rolling30dLow.toFixed(2),
 
-        // Horizontal swings with clear names (+ aliases)
-        lastConfirmedSwingHigh30d: lastConfirmedSwingHigh30d != null ? +lastConfirmedSwingHigh30d.toFixed(2) : null,
-        lastConfirmedSwingLow30d:  lastConfirmedSwingLow30d  != null ? +lastConfirmedSwingLow30d.toFixed(2)  : null,
-        rolling30dSwingHigh: lastConfirmedSwingHigh30d != null ? +lastConfirmedSwingHigh30d.toFixed(2) : null, // alias
-        rolling30dSwingLow:  lastConfirmedSwingLow30d  != null ? +lastConfirmedSwingLow30d.toFixed(2)  : null, // alias
+        // Horizontal swings (60d window)
+        lastConfirmedSwingHigh60d: lastConfirmedSwingHigh60d != null ? +lastConfirmedSwingHigh60d.toFixed(2) : null,
+        lastConfirmedSwingLow60d:  lastConfirmedSwingLow60d  != null ? +lastConfirmedSwingLow60d.toFixed(2)  : null,
 
-        // Sloping swing ENVELOPE lines (equations) + current projected prices
-        dominantUpperSwingEnvelope30d: dominantUpperSwingEnvelope30d || null,
-        dominantLowerSwingEnvelope30d: dominantLowerSwingEnvelope30d || null,
-        // current projected resistance/support from those lines (today)
-        upperResistancePriceToday30d: upperResistancePriceToday30d,
-        lowerSupportPriceToday30d:    lowerSupportPriceToday30d,
+        // Envelope lines across 60d (containment) + today's projected prices
+        dominantUpperSwingEnvelope60d: dominantUpperSwingEnvelope60d || null,
+        dominantLowerSwingEnvelope60d: dominantLowerSwingEnvelope60d || null,
+        upperResistancePriceToday60d_envelope: upperResistancePriceToday60d_envelope,
+        lowerSupportPriceToday60d_envelope:    lowerSupportPriceToday60d_envelope,
 
-        // Back-compat aliases for lines:
-        rolling30dSwingHighLine: dominantUpperSwingEnvelope30d || null,
-        rolling30dSwingLowLine:  dominantLowerSwingEnvelope30d || null,
+        // Last-two-swings trendlines (what you'd draw by hand) + today's prices
+        lastTwoSwingHighTrendline60d: lastTwoSwingHighTrendline60d || null,
+        lastTwoSwingLowTrendline60d:  lastTwoSwingLowTrendline60d  || null,
+        upperResistancePriceToday60d_lastTwo: upperResistancePriceToday60d_lastTwo,
+        lowerSupportPriceToday60d_lastTwo:    lowerSupportPriceToday60d_lastTwo,
+
+        // Back-compat aliases (from earlier versions, 30d → 60d naming kept for compatibility)
+        rolling30dSwingHighLine: dominantUpperSwingEnvelope60d || null,
+        rolling30dSwingLowLine:  dominantLowerSwingEnvelope60d || null,
 
         // EMAs with explicit names (+ aliases)
         ema4hPeriod20:  ema4hPeriod20 ? +ema4hPeriod20.toFixed(2) : null,
