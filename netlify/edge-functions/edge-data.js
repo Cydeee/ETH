@@ -2,13 +2,12 @@
 // Blocks: A indicators | B derivatives+liquidations | C ROC | D volume+CVD
 //         E stress | F structure+VPVR+price | G macro | H sentiment
 // This version:
-// - FIX: primary lines correctly mapped & named:
-//     * primarySupportLine60d  (from ZigZag LOW pivots; anchors = daily LOWs)
-//     * primaryResistanceLine60d (from ZigZag HIGH pivots; anchors = daily HIGHs)
-//     * primarySupportToday60d / primaryResistanceToday60d (line @ today index)
-// - Containment on PIVOTS ONLY (not every bar).
-// - Session VWAP bands (1σ/1.5σ/2σ) + Weekly VWAP bands (1σ/1.5σ/2σ).
-// - Removed duplicate outputs: HH20/LL20, vwap/vwapUpper/vwapLower, EMA aliases.
+// - ZigZag runs on DAILY CLOSES (UTC) to get pivot indices
+// - Support line: from pivot LOWS (anchor with daily LOW values)
+// - Resistance line: from pivot HIGHS (anchor with daily HIGH values)
+// - Containment on PIVOTS ONLY (not every bar), 0.8% tolerance, max 2 breaches
+// - Removed duplicate outputs: HH20/LL20, vwap/vwapUpper/vwapLower, EMA aliases
+// - Kept: session & weekly VWAP with 1/1.5/2σ bands; price; rolling highs/lows; EMAs (period fields)
 
 export const config = { path: ["/data", "/data.json"], cache: "manual" };
 
@@ -65,9 +64,8 @@ async function buildDashboardData () {
   // ---- Tunables ----------------------------------------------------------
   const SWING_LOOKBACK_DAYS   = 60;     // ~2 months back on daily (UTC)
   const MIN_GAP_BARS          = 14;     // ≥14 daily bars between anchors
-  const SWING_ZZ_PCT          = 0.06;   // ZigZag 6% reversal for major pivots
-  // Containment on PIVOTS ONLY:
-  const CONTAIN_TOL_PCT       = 0.008;  // 0.8% tolerance at pivots
+  const SWING_ZZ_PCT          = 0.06;   // ZigZag 6% reversal (on CLOSES)
+  const CONTAIN_TOL_PCT       = 0.008;  // 0.8% tolerance (pivots only)
   const CONTAIN_MAX_VIOLS     = 2;      // allow up to 2 pivot breaches
   // -----------------------------------------------------------------------
 
@@ -173,41 +171,68 @@ async function buildDashboardData () {
     return res;
   }
 
-  // --- ZigZag pivots (percent reversal) on series (daily, UTC) ---
-  function zigzagPivots(prices, pct) {
-    const pivots = [];
-    if (!prices || prices.length === 0) return pivots;
+  // --- ZigZag pivots (percent reversal) on DAILY CLOSES (UTC) ------------
+  function zigzagPivotsOnCloses(closes, pct) {
+    const piv = [];
+    if (!closes || closes.length === 0) return piv;
     const thr = Math.max(pct, 0.0001);
     let lastExtremeIdx = 0;
-    let lastExtreme = prices[0];
-    let dir = 0; // 0 unknown, +1 up leg, -1 down leg
+    let lastExtreme = closes[0];
+    let dir = 0; // 0 unk, +1 up leg, -1 down leg
 
-    for (let i = 1; i < prices.length; i++) {
-      const p = prices[i];
-      if (dir >= 0) { // up leg or unknown
+    for (let i = 1; i < closes.length; i++) {
+      const p = closes[i];
+
+      // Up leg (looking for top)
+      if (dir >= 0) {
         if (p >= lastExtreme) { lastExtreme = p; lastExtremeIdx = i; }
         const retrace = (lastExtreme - p) / Math.max(lastExtreme, 1);
         if (retrace >= thr) {
-          pivots.push({ idx: lastExtremeIdx, price: prices[lastExtremeIdx] });
+          piv.push({ idx: lastExtremeIdx, close: closes[lastExtremeIdx] });
           dir = -1; lastExtreme = p; lastExtremeIdx = i;
         }
       }
-      if (dir <= 0) { // down leg or unknown
+      // Down leg (looking for bottom)
+      if (dir <= 0) {
         if (p <= lastExtreme) { lastExtreme = p; lastExtremeIdx = i; }
         const retrace = (p - lastExtreme) / Math.max(lastExtreme, 1);
         if (retrace >= thr) {
-          pivots.push({ idx: lastExtremeIdx, price: prices[lastExtremeIdx] });
+          piv.push({ idx: lastExtremeIdx, close: closes[lastExtremeIdx] });
           dir = +1; lastExtreme = p; lastExtremeIdx = i;
         }
       }
     }
-    pivots.push({ idx: lastExtremeIdx, price: prices[lastExtremeIdx] });
+    // push last extreme
+    piv.push({ idx: lastExtremeIdx, close: closes[lastExtremeIdx] });
 
+    // dedupe consecutive same-idx
     const out = [];
-    for (let k = 0; k < pivots.length; k++) {
-      if (k === 0 || pivots[k].idx !== pivots[k-1].idx) out.push(pivots[k]);
+    for (let k = 0; k < piv.length; k++) {
+      if (k === 0 || piv[k].idx !== piv[k-1].idx) out.push(piv[k]);
     }
     return out;
+  }
+
+  // Classify pivots into highs/lows using neighbors (alternating)
+  function classifyPivots(pivots) {
+    const highs = [];
+    const lows  = [];
+    for (let i = 0; i < pivots.length; i++) {
+      const curr = pivots[i];
+      const prev = pivots[i-1];
+      const next = pivots[i+1];
+      if (prev && next) {
+        if (curr.close >= prev.close && curr.close >= next.close) highs.push(curr);
+        else if (curr.close <= prev.close && curr.close <= next.close) lows.push(curr);
+      } else if (!prev && next) {
+        // first pivot: compare to next only (best effort)
+        if (curr.close >= next.close) highs.push(curr); else lows.push(curr);
+      } else if (!next && prev) {
+        // last pivot: compare to prev only
+        if (curr.close >= prev.close) highs.push(curr); else lows.push(curr);
+      }
+    }
+    return { highs, lows };
   }
 
   /* BLOCK A --------------------------------------------------------------- */
@@ -403,8 +428,8 @@ async function buildDashboardData () {
 
       // --- Weekly VWAP (UTC week start Monday 00:00) with bands 1σ/1.5σ/2σ
       const weekStart = new Date(); weekStart.setUTCHours(0,0,0,0);
-      const dow = weekStart.getUTCDay();           // 0..6 (Sun..Sat)
-      const daysFromMon = (dow + 6) % 7;           // Mon=0
+      const dow = weekStart.getUTCDay();
+      const daysFromMon = (dow + 6) % 7; // Mon=0
       weekStart.setUTCDate(weekStart.getUTCDate() - daysFromMon);
       const weekBars = await fetchKlinesPaginated(SYMBOL, "15m", weekStart.getTime(), nowTs);
       let vSumW=0, pvSumW=0, pv2W=0;
@@ -425,97 +450,92 @@ async function buildDashboardData () {
       const weeklyVwapBand2Upper   = +(weeklyVwap + 2*sigmaWeek).toFixed(2);
       const weeklyVwapBand2Lower   = +(weeklyVwap - 2*sigmaWeek).toFixed(2);
 
-      // Rolling highs/lows from daily bars (UTC)
+      // --- Daily series (UTC) & ZigZag pivots on CLOSES
       const highs1d = bars1d.map(r=>+r[2]);
       const lows1d  = bars1d.map(r=>+r[3]);
       const closes1d= bars1d.map(r=>+r[4]);
       const times1d = bars1d.map(r=>+r[0]);
       const len = highs1d.length;
-      const sliceN = (arr,n)=> arr.length>=n ? arr.slice(arr.length-n) : arr.slice(0);
 
-      const rolling7dHigh  = Math.max(...sliceN(highs1d,7));
-      const rolling7dLow   = Math.min(...sliceN(lows1d,7));
-      const rolling30dHigh = Math.max(...sliceN(highs1d,30));
-      const rolling30dLow  = Math.min(...sliceN(lows1d,30));
+      const pivClosesAll = zigzagPivotsOnCloses(closes1d, SWING_ZZ_PCT);
+      const { highs: pivHighsAll, lows: pivLowsAll } = classifyPivots(pivClosesAll);
 
-      // Window indices for ~60d
+      // Restrict to lookback window (by index)
       const windowStart = Math.max(0, len - SWING_LOOKBACK_DAYS);
       const endIdx = len - 1;
 
-      // ---- PRIMARY LINES: ZigZag pivots + containment on pivots only
-      const zzLows  = zigzagPivots(lows1d,  SWING_ZZ_PCT).filter(p => p.idx >= windowStart);
-      const zzHighs = zigzagPivots(highs1d, SWING_ZZ_PCT).filter(p => p.idx >= windowStart);
+      const pivHighs = pivHighsAll.filter(p => p.idx >= windowStart);
+      const pivLows  = pivLowsAll.filter(p => p.idx >= windowStart);
 
-      function pickPrimarySupport(pivotsLows, lowsSeries) {
+      // ---- PRIMARY LINES: pick best pair with containment on pivots only
+      function pickPrimarySupport(pivotLows, lowsSeries) {
         let best = null; // choose by MAX slope
-        for (let a=0; a<pivotsLows.length-1; a++){
-          for (let b=a+1; b<pivotsLows.length; b++){
-            const A = pivotsLows[a], B = pivotsLows[b];
+        for (let a=0; a<pivotLows.length-1; a++){
+          for (let b=a+1; b<pivotLows.length; b++){
+            const A = pivotLows[a], B = pivotLows[b];
             if ((B.idx - A.idx) < MIN_GAP_BARS) continue;
-            const slope = (B.price - A.price) / (B.idx - A.idx);
-            const intercept = A.price - slope * A.idx;
 
-            // Containment: check ONLY ZigZag pivot lows from A → end
+            const Ay = lowsSeries[A.idx], By = lowsSeries[B.idx];
+            const slope = (By - Ay) / (B.idx - A.idx);
+            const intercept = Ay - slope * A.idx;
+
+            // Containment: ONLY test pivot LOWS from A → end
             let viol = 0;
-            const pivotLowsFromA = pivotsLows.filter(p => p.idx >= A.idx);
-            for (const P of pivotLowsFromA) {
+            for (const P of pivotLows) {
+              if (P.idx < A.idx) continue;
               const lineAtP = slope * P.idx + intercept;
-              if (P.price < lineAtP * (1 - CONTAIN_TOL_PCT)) { 
-                viol++; if (viol > CONTAIN_MAX_VIOLS) break; 
-              }
+              const Py = lowsSeries[P.idx];
+              if (Py < lineAtP * (1 - CONTAIN_TOL_PCT)) { viol++; if (viol > CONTAIN_MAX_VIOLS) break; }
             }
             if (viol > CONTAIN_MAX_VIOLS) continue;
 
-            if (!best || slope > best.slope) {
-              best = { slope, intercept, A, B };
-            }
+            if (!best || slope > best.slope) best = { slope, intercept, Aidx: A.idx, Bidx: B.idx };
           }
         }
         if (!best) return null;
-        const low1Idx = best.A.idx, low2Idx = best.B.idx;
+        const today = +(best.slope * endIdx + best.intercept).toFixed(2);
         return {
-          A: { idx: low1Idx, ts: times1d[low1Idx], price: +lowsSeries[low1Idx].toFixed(2) },
-          B: { idx: low2Idx, ts: times1d[low2Idx], price: +lowsSeries[low2Idx].toFixed(2) },
-          today: +((best.slope*endIdx + best.intercept).toFixed(2))
+          A: { idx: best.Aidx, ts: times1d[best.Aidx], price: +lowsSeries[best.Aidx].toFixed(2) },
+          B: { idx: best.Bidx, ts: times1d[best.Bidx], price: +lowsSeries[best.Bidx].toFixed(2) },
+          today
         };
       }
 
-      function pickPrimaryResistance(pivotsHighs, highsSeries) {
-        let best = null; // choose by MIN slope (most negative)
-        for (let a=0; a<pivotsHighs.length-1; a++){
-          for (let b=a+1; b<pivotsHighs.length; b++){
-            const A = pivotsHighs[a], B = pivotsHighs[b];
+      function pickPrimaryResistance(pivotHighs, highsSeries) {
+        let best = null; // choose by MOST NEGATIVE slope
+        for (let a=0; a<pivotHighs.length-1; a++){
+          for (let b=a+1; b<pivotHighs.length; b++){
+            const A = pivotHighs[a], B = pivotHighs[b];
             if ((B.idx - A.idx) < MIN_GAP_BARS) continue;
-            const slope = (B.price - A.price) / (B.idx - A.idx);
-            const intercept = A.price - slope * A.idx;
 
-            // Containment: check ONLY ZigZag pivot highs from A → end
+            const Ay = highsSeries[A.idx], By = highsSeries[B.idx];
+            const slope = (By - Ay) / (B.idx - A.idx);
+            const intercept = Ay - slope * A.idx;
+
+            // Containment: ONLY test pivot HIGHS from A → end
             let viol = 0;
-            const pivotHighsFromA = pivotsHighs.filter(p => p.idx >= A.idx);
-            for (const P of pivotHighsFromA) {
+            for (const P of pivotHighs) {
+              if (P.idx < A.idx) continue;
               const lineAtP = slope * P.idx + intercept;
-              if (P.price > lineAtP * (1 + CONTAIN_TOL_PCT)) { 
-                viol++; if (viol > CONTAIN_MAX_VIOLS) break; 
-              }
+              const Py = highsSeries[P.idx];
+              if (Py > lineAtP * (1 + CONTAIN_TOL_PCT)) { viol++; if (viol > CONTAIN_MAX_VIOLS) break; }
             }
             if (viol > CONTAIN_MAX_VIOLS) continue;
 
-            if (!best || slope < best.slope) {
-              best = { slope, intercept, A, B };
-            }
+            if (!best || slope < best.slope) best = { slope, intercept, Aidx: A.idx, Bidx: B.idx };
           }
         }
         if (!best) return null;
-        const high1Idx = best.A.idx, high2Idx = best.B.idx;
+        const today = +(best.slope * endIdx + best.intercept).toFixed(2);
         return {
-          A: { idx: high1Idx, ts: times1d[high1Idx], price: +highsSeries[high1Idx].toFixed(2) },
-          B: { idx: high2Idx, ts: times1d[high2Idx], price: +highsSeries[high2Idx].toFixed(2) },
-          today: +((best.slope*endIdx + best.intercept).toFixed(2))
+          A: { idx: best.Aidx, ts: times1d[best.Aidx], price: +highsSeries[best.Aidx].toFixed(2) },
+          B: { idx: best.Bidx, ts: times1d[best.Bidx], price: +highsSeries[best.Bidx].toFixed(2) },
+          today
         };
       }
 
-      const primarySupport     = pickPrimarySupport(zzLows, lows1d);
-      const primaryResistance  = pickPrimaryResistance(zzHighs, highs1d);
+      const primarySupport     = pickPrimarySupport(pivLows,  lows1d);
+      const primaryResistance  = pickPrimaryResistance(pivHighs, highs1d);
 
       // EMAs (4h and 1d)
       const closes4h = bars4h.map(r=>+r[4]);
