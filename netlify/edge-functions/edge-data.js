@@ -2,10 +2,12 @@
 // Blocks: A indicators | B derivatives+liquidations | C ROC | D volume+CVD
 //         E stress | F structure+VPVR+price | G macro | H sentiment
 // Updates in F:
-// - VWAP bands: session (UTC day) at 1σ, 1.5σ, 2σ with clear names
-// - Self-explanatory metric names + backward-compat aliases
-// - Sloping swing ENVELOPE lines (upper/lower) over last 30d + fallback
+// - Session VWAP (UTC day) bands at 1σ, 1.5σ, 2σ, with legacy aliases (vwap, vwapUpper, vwapLower -> 1σ)
+// - Weekly VWAP (UTC week anchored Monday 00:00) bands at 1σ, 1.5σ, 2σ
+// - Sloping swing ENVELOPE lines (upper/lower) that contain (almost) all bars over last 30d,
+//   plus CURRENT projected resistance/support price from these lines
 // - Rolling highs/lows, horizontal swings, 4h/1d EMAs
+// - Safer fetch for VWAP (pagination for 1m so we don't clip at 1000 bars)
 
 export const config = { path: ["/data", "/data.json"], cache: "manual" };
 
@@ -110,6 +112,9 @@ async function buildDashboardData () {
   };
   const roc=(a,n)=> a.length>=n+1 ? ((a[a.length-1]-a[a.length-(n+1)])/a[a.length-(n+1)])*100 : 0;
 
+  // small utils
+  const clampNum = v => (Number.isFinite(v) ? v : 0);
+
   // Wilder ADX
   const adx = (h,l,c,p=14)=>{
     if(h.length<p+1) return 0;
@@ -139,6 +144,30 @@ async function buildDashboardData () {
     }
     return +sma(dx.slice(dx.length - p),p).toFixed(2);
   };
+
+  // --- Kline pagination for full-range VWAPs ---
+  const INTERVAL_MS = {
+    "1m": 60000, "3m": 180000, "5m": 300000, "15m": 900000,
+    "30m": 1800000, "1h": 3600000, "4h": 14400000,
+    "1d": 86400000, "1w": 604800000
+  };
+  async function fetchKlinesPaginated(symbol, interval, startTime, endTime){
+    const res = [];
+    const step = INTERVAL_MS[interval] || 60000;
+    let from = startTime;
+    // Binance max 1000 per request
+    for (let guard=0; guard<50 && from < endTime; guard++){
+      const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&startTime=${from}&endTime=${endTime}&limit=1000`;
+      const chunk = await safeJson(url);
+      if (!Array.isArray(chunk) || chunk.length === 0) break;
+      res.push(...chunk);
+      const lastOpen = +chunk[chunk.length-1][0];
+      const nextFrom = lastOpen + step;
+      if (nextFrom <= from) break;
+      from = nextFrom;
+    }
+    return res;
+  }
 
   /* BLOCK A --------------------------------------------------------------- */
   for (const tf of ["15m","1h","4h","1d"]) {
@@ -197,7 +226,7 @@ async function buildDashboardData () {
   /* BLOCK C --------------------------------------------------------------- */
   for(const tf of ["15m","1h","4h","1d"]){
     try{
-      const kl=await safeJson(`https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=${tf}&limit=21`);
+      const kl=await safeJson(`https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=${tf}&limit=21}`);
       const c=kl.map(r=>+r[4]);
       result.dataC[tf]={roc10:+roc(c,10).toFixed(2), roc20:+roc(c,20).toFixed(2)};
     }catch(e){
@@ -296,7 +325,7 @@ async function buildDashboardData () {
     const last1m = await safeJson(`https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=1m&limit=1`);
     result.dataF.price = +(+last1m[0][4]).toFixed(2);
 
-    // Levels: Pivot, R1/S1, Highest/Lowest of last 20h, Session VWAP bands (UTC day)
+    // Levels: Pivot, R1/S1, Highest/Lowest of last 20h, VWAP bands (session + weekly)
     const y = bars1d[bars1d.length-2];
     if (y) {
       const yH = +y[2], yL = +y[3], yC = +y[4];
@@ -309,30 +338,52 @@ async function buildDashboardData () {
       const highestHighLast20h = Math.max(...h1.map(b=>+b[2]));
       const lowestLowLast20h  = Math.min(...h1.map(b=>+b[3]));
 
-      // Session VWAP = midnight UTC → now; bands at 1σ, 1.5σ, 2σ (volume-weighted)
+      // --- Session VWAP = midnight UTC → now (paginate 1m safely), bands at 1σ, 1.5σ, 2σ
       const midnight = new Date(); midnight.setUTCHours(0,0,0,0);
-      const vBars = await safeJson(`https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=1m&startTime=${midnight.getTime()}&limit=1000`);
+      const nowTs = Date.now();
+      const dayBars = await fetchKlinesPaginated(SYMBOL, "1m", midnight.getTime(), nowTs);
       let vSum=0, pvSum=0, pv2=0;
-      for (let i=0;i<vBars.length;i++){
-        const b=vBars[i];
+      for (let i=0;i<dayBars.length;i++){
+        const b=dayBars[i];
         const vol = +b[5];
-        const px  = (+b[1]+ +b[2]+ +b[3]+ +b[4]) / 4;
+        const px  = (+b[1]+ +b[2]+ +b[3]+ +b[4]) / 4; // OHLC mean proxy
         vSum += vol;
         pvSum += px * vol;
         pv2   += px * px * vol;
       }
       const sessionVwap  = vSum ? (pvSum / vSum) : +last1m[0][4];
-      const sigma        = Math.sqrt(Math.max(vSum ? (pv2/vSum - sessionVwap*sessionVwap) : 0, 0));
-      const sigma1       = sigma;
-      const sigma1_5     = 1.5 * sigma;
-      const sigma2       = 2 * sigma;
+      const sigmaSess    = Math.sqrt(Math.max(vSum ? (pv2/vSum - sessionVwap*sessionVwap) : 0, 0));
+      const sessionVwapBand1Upper   = +(sessionVwap + sigmaSess).toFixed(2);
+      const sessionVwapBand1Lower   = +(sessionVwap - sigmaSess).toFixed(2);
+      const sessionVwapBand1_5Upper = +(sessionVwap + 1.5*sigmaSess).toFixed(2);
+      const sessionVwapBand1_5Lower = +(sessionVwap - 1.5*sigmaSess).toFixed(2);
+      const sessionVwapBand2Upper   = +(sessionVwap + 2*sigmaSess).toFixed(2);
+      const sessionVwapBand2Lower   = +(sessionVwap - 2*sigmaSess).toFixed(2);
 
-      const sessionVwapBand1Upper   = +(sessionVwap + sigma1).toFixed(2);
-      const sessionVwapBand1Lower   = +(sessionVwap - sigma1).toFixed(2);
-      const sessionVwapBand1_5Upper = +(sessionVwap + sigma1_5).toFixed(2);
-      const sessionVwapBand1_5Lower = +(sessionVwap - sigma1_5).toFixed(2);
-      const sessionVwapBand2Upper   = +(sessionVwap + sigma2).toFixed(2);
-      const sessionVwapBand2Lower   = +(sessionVwap - sigma2).toFixed(2);
+      // --- Weekly VWAP = Monday 00:00 UTC → now (15m bars so <= 1000), bands at 1σ, 1.5σ, 2σ
+      const weekStart = new Date(); weekStart.setUTCHours(0,0,0,0);
+      // JS getUTCDay: 0=Sun...6=Sat. We want Monday start:
+      const dow = weekStart.getUTCDay(); // 0..6
+      const daysFromMon = (dow + 6) % 7; // Mon=0, Tue=1, ... Sun=6
+      weekStart.setUTCDate(weekStart.getUTCDate() - daysFromMon);
+      const weekBars = await fetchKlinesPaginated(SYMBOL, "15m", weekStart.getTime(), nowTs);
+      let vSumW=0, pvSumW=0, pv2W=0;
+      for (let i=0;i<weekBars.length;i++){
+        const b=weekBars[i];
+        const vol = +b[5];
+        const px  = (+b[1]+ +b[2]+ +b[3]+ +b[4]) / 4; // OHLC mean proxy
+        vSumW += vol;
+        pvSumW += px * vol;
+        pv2W   += px * px * vol;
+      }
+      const weeklyVwap  = vSumW ? (pvSumW / vSumW) : +last1m[0][4];
+      const sigmaWeek   = Math.sqrt(Math.max(vSumW ? (pv2W/vSumW - weeklyVwap*weeklyVwap) : 0, 0));
+      const weeklyVwapBand1Upper   = +(weeklyVwap + sigmaWeek).toFixed(2);
+      const weeklyVwapBand1Lower   = +(weeklyVwap - sigmaWeek).toFixed(2);
+      const weeklyVwapBand1_5Upper = +(weeklyVwap + 1.5*sigmaWeek).toFixed(2);
+      const weeklyVwapBand1_5Lower = +(weeklyVwap - 1.5*sigmaWeek).toFixed(2);
+      const weeklyVwapBand2Upper   = +(weeklyVwap + 2*sigmaWeek).toFixed(2);
+      const weeklyVwapBand2Lower   = +(weeklyVwap - 2*sigmaWeek).toFixed(2);
 
       // Rolling highs/lows from daily bars
       const highs1d = bars1d.map(r=>+r[2]);
@@ -408,138 +459,4 @@ async function buildDashboardData () {
 
             const projToday = slope * endIdx + intercept;
             if (!best) {
-              best = { slope, intercept, score: projToday };
-            } else if (side === "high" ? (projToday < best.score) : (projToday > best.score)) {
-              best = { slope, intercept, score: projToday };
-            }
-          }
-        }
-        if (!best) return null;
-        return {
-          slope: +best.slope.toFixed(6),
-          intercept: +best.intercept.toFixed(2)
-        };
-      };
-
-      let dominantUpperSwingEnvelope30d = pickEnvelopeLine(swingHighs30, "high");
-      let dominantLowerSwingEnvelope30d = pickEnvelopeLine(swingLows30,  "low");
-
-      // Fallback: if envelope not found, use 2 most recent confirmed swings
-      const fallbackLine = (arr)=>{
-        if (arr && arr.length >= 2) {
-          const A = arr[arr.length-2], B = arr[arr.length-1];
-          if (B.idx !== A.idx) {
-            const slope = (B.price - A.price) / (B.idx - A.idx);
-            const intercept = A.price - slope * A.idx;
-            return { slope:+slope.toFixed(6), intercept:+intercept.toFixed(2) };
-          }
-        }
-        return null;
-      };
-      if (!dominantUpperSwingEnvelope30d) dominantUpperSwingEnvelope30d = fallbackLine(swingHighs30);
-      if (!dominantLowerSwingEnvelope30d) dominantLowerSwingEnvelope30d = fallbackLine(swingLows30);
-
-      // EMAs (4h and 1d) with explicit names (and keep old aliases)
-      const closes4h = bars4h.map(r=>+r[4]);
-      const ema4hPeriod20  = ema(closes4h,20)  || 0;
-      const ema4hPeriod50  = ema(closes4h,50)  || 0;
-      const ema4hPeriod200 = ema(closes4h,200) || 0;
-
-      const ema1dPeriod20  = ema(closes1d,20)  || 0;
-      const ema1dPeriod50  = ema(closes1d,50)  || 0;
-      const ema1dPeriod200 = ema(closes1d,200) || 0;
-
-      // Final levels object (self-explanatory + backward-compat aliases)
-      const levels = {
-        // Pivots
-        dailyPivot:  +pivot.toFixed(2),
-        dailyR1:     +R1.toFixed(2),
-        dailyS1:     +S1.toFixed(2),
-
-        // High/Low last 20h (and aliases)
-        highestHighLast20h: +highestHighLast20h.toFixed(2),
-        lowestLowLast20h:   +lowestLowLast20h.toFixed(2),
-        HH20: +highestHighLast20h.toFixed(2), // alias
-        LL20: +lowestLowLast20h.toFixed(2),   // alias
-
-        // Session VWAP (UTC day) and bands (1σ, 1.5σ, 2σ)
-        sessionVwap: +sessionVwap.toFixed(2),
-        sessionVwapBand1Upper:   sessionVwapBand1Upper,
-        sessionVwapBand1Lower:   sessionVwapBand1Lower,
-        sessionVwapBand1_5Upper: sessionVwapBand1_5Upper,
-        sessionVwapBand1_5Lower: sessionVwapBand1_5Lower,
-        sessionVwapBand2Upper:   sessionVwapBand2Upper,
-        sessionVwapBand2Lower:   sessionVwapBand2Lower,
-
-        // Backward-compat aliases (map to 1σ)
-        vwap:       +sessionVwap.toFixed(2),
-        vwapUpper:  sessionVwapBand1Upper,
-        vwapLower:  sessionVwapBand1Lower,
-
-        // Rolling highs/lows
-        rolling7dHigh:  +rolling7dHigh.toFixed(2),
-        rolling7dLow:   +rolling7dLow.toFixed(2),
-        rolling30dHigh: +rolling30dHigh.toFixed(2),
-        rolling30dLow:  +rolling30dLow.toFixed(2),
-
-        // Horizontal swings with clear names (+ aliases)
-        lastConfirmedSwingHigh30d: lastConfirmedSwingHigh30d != null ? +lastConfirmedSwingHigh30d.toFixed(2) : null,
-        lastConfirmedSwingLow30d:  lastConfirmedSwingLow30d  != null ? +lastConfirmedSwingLow30d.toFixed(2)  : null,
-        rolling30dSwingHigh: lastConfirmedSwingHigh30d != null ? +lastConfirmedSwingHigh30d.toFixed(2) : null, // alias
-        rolling30dSwingLow:  lastConfirmedSwingLow30d  != null ? +lastConfirmedSwingLow30d.toFixed(2)  : null, // alias
-
-        // Sloping swing envelope lines (equations)
-        dominantUpperSwingEnvelope30d: dominantUpperSwingEnvelope30d || null,
-        dominantLowerSwingEnvelope30d: dominantLowerSwingEnvelope30d || null,
-        // Back-compat aliases:
-        rolling30dSwingHighLine: dominantUpperSwingEnvelope30d || null,
-        rolling30dSwingLowLine:  dominantLowerSwingEnvelope30d || null,
-
-        // EMAs with explicit names (+ aliases)
-        ema4hPeriod20:  ema4hPeriod20 ? +ema4hPeriod20.toFixed(2) : null,
-        ema4hPeriod50:  ema4hPeriod50 ? +ema4hPeriod50.toFixed(2) : null,
-        ema4hPeriod200: ema4hPeriod200 ? +ema4hPeriod200.toFixed(2) : null,
-        ema1dPeriod20:  ema1dPeriod20 ? +ema1dPeriod20.toFixed(2) : null,
-        ema1dPeriod50:  ema1dPeriod50 ? +ema1dPeriod50.toFixed(2) : null,
-        ema1dPeriod200: ema1dPeriod200 ? +ema1dPeriod200.toFixed(2) : null,
-        // aliases:
-        ema4h20:  ema4hPeriod20 ? +ema4hPeriod20.toFixed(2) : null,
-        ema4h50:  ema4hPeriod50 ? +ema4hPeriod50.toFixed(2) : null,
-        ema4h200: ema4hPeriod200 ? +ema4hPeriod200.toFixed(2) : null,
-        ema1d20:  ema1dPeriod20 ? +ema1dPeriod20.toFixed(2) : null,
-        ema1d50:  ema1dPeriod50 ? +ema1dPeriod50.toFixed(2) : null,
-        ema1d200: ema1dPeriod200 ? +ema1dPeriod200.toFixed(2) : null
-      };
-
-      result.dataF.levels = levels;
-    }
-  } catch(e) {
-    result.errors.push("F: "+e.message);
-  }
-
-  /* BLOCK G --------------------------------------------------------------- */
-  try{
-    const gv=await safeJson("https://api.coingecko.com/api/v3/global");
-    const d=(gv&&gv.data)?gv.data:{ total_market_cap:{usd:0}, market_cap_change_percentage_24h_usd:0, market_cap_percentage:{btc:0,eth:0} };
-    result.dataG={
-      totalMcapT:+((d.total_market_cap.usd||0)/1e12).toFixed(2),
-      mcap24hPct:+(d.market_cap_change_percentage_24h_usd||0).toFixed(2),
-      btcDominance:+(d.market_cap_percentage.btc||0).toFixed(2),
-      ethDominance:+(d.market_cap_percentage.eth||0).toFixed(2)
-    };
-  }catch(e){
-    result.errors.push("G: "+e.message);
-  }
-
-  /* BLOCK H --------------------------------------------------------------- */
-  try{
-    const fg=await safeJson("https://api.alternative.me/fng/?limit=1");
-    const row=(fg && fg.data && fg.data[0]) ? fg.data[0] : null;
-    if(!row) throw new Error("FNG missing");
-    result.dataH={fearGreed:`${row.value} · ${row.value_classification}`};
-  }catch(e){
-    result.errors.push("H: "+e.message);
-  }
-
-  return result;
-}
+              best = { slope, inte
