@@ -2,12 +2,12 @@
 // Blocks: A indicators | B derivatives+liquidations | C ROC | D volume+CVD
 //         E stress | F structure+VPVR+price | G macro | H sentiment
 // This version:
-// - Primary structure lines from ZigZag (daily) pivots with containment:
+// - Primary structure lines from ZigZag (daily) pivots with CONTAINMENT ON PIVOTS ONLY:
 //     * primaryRisingSupportLine60d  (anchors only: dates dd/mm + prices)
 //     * primaryFallingResistanceLine60d (anchors only)
-//     * primarySupportToday60d / primaryResistanceToday60d (kept for UI)
+//     * primarySupportToday60d / primaryResistanceToday60d (for plotting)
 // - Session VWAP bands (1σ/1.5σ/2σ) + Weekly VWAP bands (1σ/1.5σ/2σ)
-// - Removed envelope keys from output per request.
+// - Removed envelope outputs per request.
 
 export const config = { path: ["/data", "/data.json"], cache: "manual" };
 
@@ -62,14 +62,12 @@ async function buildDashboardData () {
   const LIMIT  = 250;
 
   // ---- Tunables ----------------------------------------------------------
-  // Structure windows / pivots
   const SWING_LOOKBACK_DAYS   = 60;     // look ~2 months back on daily
   const MIN_GAP_BARS          = 14;     // ≥14 daily bars between anchors
-  // ZigZag threshold for MAJOR swings (daily)
-  const SWING_ZZ_PCT          = 0.06;   // 6% reversal threshold (tune 5–8%)
-  // Containment rule: tolerance & max allowed breaches
-  const CONTAIN_TOL_PCT       = 0.008;  // 0.8% wick tolerance
-  const CONTAIN_MAX_VIOLS     = 2;      // allow up to 2 pierces
+  const SWING_ZZ_PCT          = 0.06;   // ZigZag 6% reversal for major pivots
+  // Containment on PIVOTS ONLY:
+  const CONTAIN_TOL_PCT       = 0.008;  // 0.8% wick tolerance at pivots
+  const CONTAIN_MAX_VIOLS     = 2;      // allow up to 2 pivot breaches
   // -----------------------------------------------------------------------
 
   const result = {
@@ -443,12 +441,12 @@ async function buildDashboardData () {
       const windowStart = Math.max(0, len - SWING_LOOKBACK_DAYS);
       const endIdx = len - 1;
 
-      // ---- PRIMARY LINES: ZigZag pivots + containment (anchors only in output)
+      // ---- PRIMARY LINES: ZigZag pivots + containment on pivots only (anchors-only output)
       const zzLows  = zigzagPivots(lows1d,  SWING_ZZ_PCT).filter(p => p.idx >= windowStart);
       const zzHighs = zigzagPivots(highs1d, SWING_ZZ_PCT).filter(p => p.idx >= windowStart);
 
       function pickPrimarySupport(pivotsLows) {
-        let best = null; // choose by MAX slope (no extra tie-breakers)
+        let best = null; // choose by MAX slope
         for (let a=0; a<pivotsLows.length-1; a++){
           for (let b=a+1; b<pivotsLows.length; b++){
             const A = pivotsLows[a], B = pivotsLows[b];
@@ -456,11 +454,14 @@ async function buildDashboardData () {
             const slope = (B.price - A.price) / (B.idx - A.idx);
             const intercept = A.price - slope * A.idx;
 
-            // Containment: lows from A.idx → end must stay above line*(1 - tol)
+            // Containment: check ONLY ZigZag pivot lows from A → end
             let viol = 0;
-            for (let k = A.idx; k <= endIdx; k++){
-              const line = slope * k + intercept;
-              if (lows1d[k] < line * (1 - CONTAIN_TOL_PCT)) { viol++; if (viol > CONTAIN_MAX_VIOLS) break; }
+            const pivotLowsFromA = pivotsLows.filter(p => p.idx >= A.idx);
+            for (const P of pivotLowsFromA) {
+              const lineAtP = slope * P.idx + intercept;
+              if (P.price < lineAtP * (1 - CONTAIN_TOL_PCT)) { 
+                viol++; if (viol > CONTAIN_MAX_VIOLS) break; 
+              }
             }
             if (viol > CONTAIN_MAX_VIOLS) continue;
 
@@ -486,11 +487,14 @@ async function buildDashboardData () {
             const slope = (B.price - A.price) / (B.idx - A.idx);
             const intercept = A.price - slope * A.idx;
 
-            // Containment: highs from A.idx → end must stay below line*(1 + tol)
+            // Containment: check ONLY ZigZag pivot highs from A → end
             let viol = 0;
-            for (let k = A.idx; k <= endIdx; k++){
-              const line = slope * k + intercept;
-              if (highs1d[k] > line * (1 + CONTAIN_TOL_PCT)) { viol++; if (viol > CONTAIN_MAX_VIOLS) break; }
+            const pivotHighsFromA = pivotsHighs.filter(p => p.idx >= A.idx);
+            for (const P of pivotHighsFromA) {
+              const lineAtP = slope * P.idx + intercept;
+              if (P.price > lineAtP * (1 + CONTAIN_TOL_PCT)) { 
+                viol++; if (viol > CONTAIN_MAX_VIOLS) break; 
+              }
             }
             if (viol > CONTAIN_MAX_VIOLS) continue;
 
@@ -515,11 +519,11 @@ async function buildDashboardData () {
       const ema4hPeriod20  = ema(closes4h,20)  || 0;
       const ema4hPeriod50  = ema(closes4h,50)  || 0;
       const ema4hPeriod200 = ema(closes4h,200) || 0;
-      const ema1dPeriod20  = ema(bars1d.map(r=>+r[4]),20)  || 0;
-      const ema1dPeriod50  = ema(bars1d.map(r=>+r[4]),50)  || 0;
-      const ema1dPeriod200 = ema(bars1d.map(r=>+r[4]),200) || 0;
+      const ema1dPeriod20  = ema(closes1d,20)  || 0;
+      const ema1dPeriod50  = ema(closes1d,50)  || 0;
+      const ema1dPeriod200 = ema(closes1d,200) || 0;
 
-      // Final levels object (with anchor dates/prices only)
+      // Final levels object (anchors-only for primary lines)
       const levels = {
         // Pivots (daily)
         dailyPivot:  +pivot.toFixed(2),
