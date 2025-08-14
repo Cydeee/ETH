@@ -3,12 +3,11 @@
 //         E stress | F structure+VPVR+price | G macro | H sentiment
 // This version:
 // - Primary structure lines from ZigZag (daily) pivots with containment:
-//   * primaryRisingSupportLine60d (max slope from lows, ≥14d gap)
-//   * primaryFallingResistanceLine60d (min slope from highs, ≥14d gap)
-//   * primarySupportToday60d / primaryResistanceToday60d
-// - Keeps envelope (containment) lines as secondary
+//     * primaryRisingSupportLine60d  (anchors only: dates dd/mm + prices)
+//     * primaryFallingResistanceLine60d (anchors only)
+//     * primarySupportToday60d / primaryResistanceToday60d (kept for UI)
 // - Session VWAP bands (1σ/1.5σ/2σ) + Weekly VWAP bands (1σ/1.5σ/2σ)
-// - Self-explanatory names + a few backward-compat aliases
+// - Removed envelope keys from output per request.
 
 export const config = { path: ["/data", "/data.json"], cache: "manual" };
 
@@ -68,14 +67,9 @@ async function buildDashboardData () {
   const MIN_GAP_BARS          = 14;     // ≥14 daily bars between anchors
   // ZigZag threshold for MAJOR swings (daily)
   const SWING_ZZ_PCT          = 0.06;   // 6% reversal threshold (tune 5–8%)
-  // Containment rule (fix #2): tolerance & max allowed breaches
+  // Containment rule: tolerance & max allowed breaches
   const CONTAIN_TOL_PCT       = 0.008;  // 0.8% wick tolerance
   const CONTAIN_MAX_VIOLS     = 2;      // allow up to 2 pierces
-  // Envelope lines (secondary) keep their own constraints
-  const ENVELOPE_TOL_PCT      = 0.006;  // 0.6% wick tolerance
-  const ENVELOPE_MAX_VIOLS    = 2;
-  const SLOPE_MIN_USD_PER_DAY = 0.02;   // used for envelope only
-  const SLOPE_MAX_USD_PER_DAY = 800;    // used for envelope only
   // -----------------------------------------------------------------------
 
   const result = {
@@ -119,7 +113,13 @@ async function buildDashboardData () {
   };
   const roc=(a,n)=> a.length>=n+1 ? ((a[a.length-1]-a[a.length-(n+1)])/a[a.length-(n+1)])*100 : 0;
 
-  const clampNum = v => (Number.isFinite(v) ? v : 0);
+  // date formatter (dd/mm) in UTC
+  const fmtDDMM = ts => {
+    const d = new Date(ts);
+    const dd = String(d.getUTCDate()).padStart(2,'0');
+    const mm = String(d.getUTCMonth()+1).padStart(2,'0');
+    return `${dd}/${mm}`;
+  };
 
   // Wilder ADX
   const adx = (h,l,c,p=14)=>{
@@ -175,8 +175,6 @@ async function buildDashboardData () {
   }
 
   // --- ZigZag pivots (percent reversal) on series (daily) ---
-  // For highs: pass highs array → returns alternating pivot points (idx/price)
-  // For lows:  pass lows  array → same.
   function zigzagPivots(prices, pct) {
     const pivots = [];
     if (!prices || prices.length === 0) return pivots;
@@ -204,10 +202,8 @@ async function buildDashboardData () {
         }
       }
     }
-    // close last leg
     pivots.push({ idx: lastExtremeIdx, price: prices[lastExtremeIdx] });
 
-    // de-dup consecutive same idx
     const out = [];
     for (let k = 0; k < pivots.length; k++) {
       if (k === 0 || pivots[k].idx !== pivots[k-1].idx) out.push(pivots[k]);
@@ -350,7 +346,7 @@ async function buildDashboardData () {
     const bars1d = await safeJson(`https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=1d&limit=220`);
     const bars1w = await safeJson(`https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=1w&limit=60`);
 
-    // VPVR (unchanged)
+    // VPVR
     const vp = b => {
       const bkt = {};
       for (let i=0;i<b.length;i++){
@@ -384,7 +380,7 @@ async function buildDashboardData () {
       const highestHighLast20h = Math.max(...h1.map(b=>+b[2]));
       const lowestLowLast20h  = Math.min(...h1.map(b=>+b[3]));
 
-      // --- Session VWAP (UTC day) with bands 1σ/1.5σ/2σ (paginated 1m)
+      // --- Session VWAP (UTC day) with bands 1σ/1.5σ/2σ
       const midnight = new Date(); midnight.setUTCHours(0,0,0,0);
       const nowTs = Date.now();
       const dayBars = await fetchKlinesPaginated(SYMBOL, "1m", midnight.getTime(), nowTs);
@@ -406,7 +402,7 @@ async function buildDashboardData () {
       const sessionVwapBand2Upper   = +(sessionVwap + 2*sigmaSess).toFixed(2);
       const sessionVwapBand2Lower   = +(sessionVwap - 2*sigmaSess).toFixed(2);
 
-      // --- Weekly VWAP (UTC week start Monday 00:00) with bands 1σ/1.5σ/2σ (15m bars)
+      // --- Weekly VWAP (UTC week start Monday 00:00) with bands 1σ/1.5σ/2σ
       const weekStart = new Date(); weekStart.setUTCHours(0,0,0,0);
       const dow = weekStart.getUTCDay();           // 0..6 (Sun..Sat)
       const daysFromMon = (dow + 6) % 7;           // Mon=0
@@ -447,12 +443,12 @@ async function buildDashboardData () {
       const windowStart = Math.max(0, len - SWING_LOOKBACK_DAYS);
       const endIdx = len - 1;
 
-      // ---- PRIMARY LINES: ZigZag pivots + containment (fixes 1 & 2 only)
+      // ---- PRIMARY LINES: ZigZag pivots + containment (anchors only in output)
       const zzLows  = zigzagPivots(lows1d,  SWING_ZZ_PCT).filter(p => p.idx >= windowStart);
       const zzHighs = zigzagPivots(highs1d, SWING_ZZ_PCT).filter(p => p.idx >= windowStart);
 
       function pickPrimarySupport(pivotsLows) {
-        let best = null; // choose by MAX slope only (no recency/touches/slope-bounds)
+        let best = null; // choose by MAX slope (no extra tie-breakers)
         for (let a=0; a<pivotsLows.length-1; a++){
           for (let b=a+1; b<pivotsLows.length; b++){
             const A = pivotsLows[a], B = pivotsLows[b];
@@ -475,16 +471,14 @@ async function buildDashboardData () {
         }
         if (!best) return null;
         return {
-          slope: +best.slope.toFixed(6),
-          intercept: +best.intercept.toFixed(2),
-          anchorA: { idx: best.A.idx, ts: times1d[best.A.idx], price: +best.A.price.toFixed(2) },
-          anchorB: { idx: best.B.idx, ts: times1d[best.B.idx], price: +best.B.price.toFixed(2) },
+          A: { idx: best.A.idx, ts: times1d[best.A.idx], price: +best.A.price.toFixed(2) },
+          B: { idx: best.B.idx, ts: times1d[best.B.idx], price: +best.B.price.toFixed(2) },
           today: +((best.slope*endIdx + best.intercept).toFixed(2))
         };
       }
 
       function pickPrimaryResistance(pivotsHighs) {
-        let best = null; // choose by MIN slope only (most negative)
+        let best = null; // choose by MIN slope (most negative)
         for (let a=0; a<pivotsHighs.length-1; a++){
           for (let b=a+1; b<pivotsHighs.length; b++){
             const A = pivotsHighs[a], B = pivotsHighs[b];
@@ -507,10 +501,8 @@ async function buildDashboardData () {
         }
         if (!best) return null;
         return {
-          slope: +best.slope.toFixed(6),
-          intercept: +best.intercept.toFixed(2),
-          anchorA: { idx: best.A.idx, ts: times1d[best.A.idx], price: +best.A.price.toFixed(2) },
-          anchorB: { idx: best.B.idx, ts: times1d[best.B.idx], price: +best.B.price.toFixed(2) },
+          A: { idx: best.A.idx, ts: times1d[best.A.idx], price: +best.A.price.toFixed(2) },
+          B: { idx: best.B.idx, ts: times1d[best.B.idx], price: +best.B.price.toFixed(2) },
           today: +((best.slope*endIdx + best.intercept).toFixed(2))
         };
       }
@@ -518,59 +510,16 @@ async function buildDashboardData () {
       const primarySupport  = pickPrimarySupport(zzLows);
       const primaryResistance = pickPrimaryResistance(zzHighs);
 
-      // ---- SECONDARY (unchanged): envelope lines across window (with slope bounds)
-      const toleranceEnv = ENVELOPE_TOL_PCT;
-      const MAX_VIOLS_ENV = ENVELOPE_MAX_VIOLS;
-      const SLOPE_MIN = SLOPE_MIN_USD_PER_DAY;
-      const SLOPE_MAX = SLOPE_MAX_USD_PER_DAY;
-
-      const pickEnvelopeLine = (pivots, side /* "high"|"low" */) => {
-        if (!pivots || pivots.length < 2) return null;
-        let best = null;
-        for (let a=0; a<pivots.length-1; a++){
-          for (let b=a+1; b<pivots.length; b++){
-            const A = pivots[a], B = pivots[b];
-            const slope = (B.price - A.price) / (B.idx - A.idx);
-            const absSlope = Math.abs(slope);
-            if (absSlope < SLOPE_MIN || absSlope > SLOPE_MAX) continue;
-            const intercept = A.price - slope * A.idx;
-
-            let violations = 0;
-            for (let k = windowStart; k <= endIdx; k++){
-              const linePrice = slope * k + intercept || 0;
-              if (side === "high") {
-                if (highs1d[k] > linePrice * (1 + toleranceEnv)) { violations++; if (violations > MAX_VIOLS_ENV) break; }
-              } else {
-                if (lows1d[k] < linePrice * (1 - toleranceEnv)) { violations++; if (violations > MAX_VIOLS_ENV) break; }
-              }
-            }
-            if (violations > MAX_VIOLS_ENV) continue;
-
-            const projToday = slope * endIdx + intercept;
-            if (!best) best = { slope, intercept, score: projToday };
-            else if (side === "high" ? (projToday < best.score) : (projToday > best.score)) {
-              best = { slope, intercept, score: projToday };
-            }
-          }
-        }
-        if (!best) return null;
-        return { slope: +best.slope.toFixed(6), intercept: +best.intercept.toFixed(2) };
-      };
-
-      // For envelopes, you can use ZigZag pivots or fractal pivots; keeping ZigZag:
-      const dominantUpperSwingEnvelope60d = pickEnvelopeLine(zzHighs, "high");
-      const dominantLowerSwingEnvelope60d = pickEnvelopeLine(zzLows,  "low");
-
       // EMAs (4h and 1d)
       const closes4h = bars4h.map(r=>+r[4]);
       const ema4hPeriod20  = ema(closes4h,20)  || 0;
       const ema4hPeriod50  = ema(closes4h,50)  || 0;
       const ema4hPeriod200 = ema(closes4h,200) || 0;
-      const ema1dPeriod20  = ema(closes1d,20)  || 0;
-      const ema1dPeriod50  = ema(closes1d,50)  || 0;
-      const ema1dPeriod200 = ema(closes1d,200) || 0;
+      const ema1dPeriod20  = ema(bars1d.map(r=>+r[4]),20)  || 0;
+      const ema1dPeriod50  = ema(bars1d.map(r=>+r[4]),50)  || 0;
+      const ema1dPeriod200 = ema(bars1d.map(r=>+r[4]),200) || 0;
 
-      // Final levels object
+      // Final levels object (with anchor dates/prices only)
       const levels = {
         // Pivots (daily)
         dailyPivot:  +pivot.toFixed(2),
@@ -611,19 +560,19 @@ async function buildDashboardData () {
         rolling30dHigh: +rolling30dHigh.toFixed(2),
         rolling30dLow:  +rolling30dLow.toFixed(2),
 
-        // PRIMARY structure lines (ZigZag + containment; no recency/touch/slope-bounds)
-        primaryRisingSupportLine60d:      primarySupport ? { slope: primarySupport.slope, intercept: primarySupport.intercept, anchorA: primarySupport.anchorA, anchorB: primarySupport.anchorB } : null,
-        primaryFallingResistanceLine60d:  primaryResistance ? { slope: primaryResistance.slope, intercept: primaryResistance.intercept, anchorA: primaryResistance.anchorA, anchorB: primaryResistance.anchorB } : null,
-        primarySupportToday60d:           primarySupport ? primarySupport.today : null,
-        primaryResistanceToday60d:        primaryResistance ? primaryResistance.today : null,
+        // PRIMARY structure lines — anchors only (dates dd/mm + prices)
+        primaryRisingSupportLine60d: primarySupport ? {
+          low1Date: fmtDDMM(primarySupport.A.ts), low1Price: primarySupport.A.price,
+          low2Date: fmtDDMM(primarySupport.B.ts), low2Price: primarySupport.B.price
+        } : null,
+        primaryFallingResistanceLine60d: primaryResistance ? {
+          high1Date: fmtDDMM(primaryResistance.A.ts), high1Price: primaryResistance.A.price,
+          high2Date: fmtDDMM(primaryResistance.B.ts), high2Price: primaryResistance.B.price
+        } : null,
 
-        // SECONDARY envelope lines (containment view; unchanged)
-        dominantUpperSwingEnvelope60d: dominantUpperSwingEnvelope60d || null,
-        dominantLowerSwingEnvelope60d: dominantLowerSwingEnvelope60d || null,
-
-        // Back-compat aliases (older payloads referenced these)
-        rolling30dSwingHighLine: dominantUpperSwingEnvelope60d || null,
-        rolling30dSwingLowLine:  dominantLowerSwingEnvelope60d || null,
+        // Projected prices today from those lines (kept for plotting)
+        primarySupportToday60d:    primarySupport ? primarySupport.today : null,
+        primaryResistanceToday60d: primaryResistance ? primaryResistance.today : null,
 
         // EMAs
         ema4hPeriod20:  ema4hPeriod20 ? +ema4hPeriod20.toFixed(2) : null,
@@ -642,8 +591,6 @@ async function buildDashboardData () {
       };
 
       result.dataF.levels = levels;
-
-      // Also keep VPVR + price at dataF root (already set above)
     }
   } catch(e) {
     result.errors.push("F: "+e.message);
