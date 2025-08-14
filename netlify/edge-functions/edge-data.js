@@ -1,10 +1,13 @@
 // netlify/edge-functions/data.js
 // Blocks: A indicators | B derivatives+liquidations | C ROC | D volume+CVD
 //         E stress | F structure+VPVR+price | G macro | H sentiment
-// Extra live-only metrics: 4 h ADX-14, absolute OI + 30-day percentile,
-// session-relative volume, cycle-anchored VWAP, swing-high/low, neckline,
-// neckBreak, Levels
-// NOTE: adapted to fetch ETH data instead of BTC.
+// Updates:
+// - Keep: price, VPVR, pivots + HH20/LL20 + VWAP bands
+// - Add (F.levels): rolling7dHigh/Low, rolling30dHigh/Low,
+//                   rolling30dSwingHigh/Low (horizontal),
+//                   rolling30dSwingHighLine/LowLine (sloping, with filters),
+//                   ema4h20/50/200, ema1d20/50/200
+// - Remove: avwapCycle, swings (H1/H2/L1/L2), neckline, neckBreak
 
 export const config = { path: ["/data", "/data.json"], cache: "manual" };
 
@@ -55,7 +58,7 @@ export default async function handler(request) {
 }
 
 async function buildDashboardData () {
-  const SYMBOL = "ETHUSDT";          // ← switched to ETH
+  const SYMBOL = "ETHUSDT";
   const LIMIT  = 250;
 
   const result = {
@@ -154,7 +157,7 @@ async function buildDashboardData () {
     const oiDelta24h=base24?(((oiCurrent-base24)/base24)*100).toFixed(1):null;
 
     const liqRaw=await safeJson("https://raw.githubusercontent.com/Cydeee/Testliquidation/main/data/totalLiquidations.json");
-    const eth=(liqRaw.data||[]).find(r=>r.symbol==="ETH")||{};   // ← switched to ETH
+    const eth=(liqRaw.data||[]).find(r=>r.symbol==="ETH")||{};
 
     result.dataB={
       fundingZ,
@@ -241,10 +244,12 @@ async function buildDashboardData () {
 
   /* BLOCK F --------------------------------------------------------------- */
   try{
-    // VPVR
-    const bars4h = await safeJson(`https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=4h&limit=96`);
-    const bars1d = await safeJson(`https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=1d&limit=60`);
+    // Fetch bars for structure/levels
+    const bars4h = await safeJson(`https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=4h&limit=200`);
+    const bars1d = await safeJson(`https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=1d&limit=220`);
     const bars1w = await safeJson(`https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=1w&limit=60`);
+
+    // VPVR (unchanged)
     const vp = b => {
       const bkt = {};
       b.forEach(r => {
@@ -263,72 +268,18 @@ async function buildDashboardData () {
     const last1m = await safeJson(`https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=1m&limit=1`);
     result.dataF.price = +(+last1m[0][4]).toFixed(2);
 
-    // Cycle-anchored VWAP
-    const closesW = bars1w.map(r=>+r[4]);
-    const lows52 = closesW.slice(-52);
-    const idxLow = lows52.indexOf(Math.min(...lows52));
-    const anchorTs = +bars1w[bars1w.length-52+idxLow][0];
-    const dailyFrom = await safeJson(`https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=1d&startTime=${anchorTs}&limit=1000`);
-    let num=0, den=0;
-    dailyFrom.forEach(r=>{
-      const p = (+r[2] + +r[3] + +r[4]) / 3;
-      const v = +r[5];
-      num += p*v;
-      den += v;
-    });
-    result.dataF.avwapCycle = +(num/den).toFixed(2);
-
-    // Swing-high/low detection (last 120×1m bars)
-    const oneM = await safeJson(`https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=1m&limit=120`);
-    const highs1m = oneM.map(r=>+r[2]);
-    const lows1m  = oneM.map(r=>+r[3]);
-    const closes1m= oneM.map(r=>+r[4]);
-    const swingsArr = [];
-    const W = 6;
-    for (let i = W; i < oneM.length - W; i++) {
-      const segHigh = Math.max(...highs1m.slice(i-W, i+W+1));
-      const segLow  = Math.min(...lows1m.slice(i-W, i+W+1));
-      const h = highs1m[i], l = lows1m[i];
-      if (h === segHigh && ((h - segLow)/segLow*100) >= 0.15) {
-        swingsArr.push({ type: "H", idx: i, price: +h.toFixed(2) });
-      }
-      if (l === segLow && ((segHigh - l)/segHigh*100) >= 0.15) {
-        swingsArr.push({ type: "L", idx: i, price: +l.toFixed(2) });
-      }
-    }
-    let H1=null, H2=null, L1=null, L2=null, neckline=null, neckBreak=false;
-    if (swingsArr.length >= 2) {
-      const last2 = swingsArr.slice(-2);
-      if (last2[0].type === last2[1].type) {
-        if (last2[0].type === "H") {
-          H2 = last2[0].price; H1 = last2[1].price;
-          const [p2,p1] = [last2[0].idx, last2[1].idx];
-          neckline = +Math.min(...lows1m.slice(p2, p1+1)).toFixed(2);
-          const prevC = closes1m[closes1m.length-2], currC = closes1m.at(-1);
-          neckBreak = prevC > neckline && currC < neckline;
-        } else {
-          L2 = last2[0].price; L1 = last2[1].price;
-          const [p2,p1] = [last2[0].idx, last2[1].idx];
-          neckline = +Math.max(...highs1m.slice(p2, p1+1)).toFixed(2);
-          const prevC = closes1m[closes1m.length-2], currC = closes1m.at(-1);
-          neckBreak = prevC < neckline && currC > neckline;
-        }
-      }
-    }
-    result.dataF.swings    = { H1, H2, L1, L2 };
-    result.dataF.neckline  = neckline;
-    result.dataF.neckBreak = neckBreak;
-
-    // Levels: Pivot, VWAP band, HH20/LL20
-    const yesterday = bars1d.at(-2);
-    if (yesterday) {
-      const yH = +yesterday[2], yL = +yesterday[3], yC = +yesterday[4];
+    // Levels: Pivot, R1/S1, HH20/LL20, Session VWAP ±σ
+    const y = bars1d.at(-2);
+    if (y) {
+      const yH = +y[2], yL = +y[3], yC = +y[4];
       const pivot = (yH + yL + yC) / 3;
       const R1 = 2 * pivot - yL;
       const S1 = 2 * pivot - yH;
+
       const h1 = await safeJson(`https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=1h&limit=20`);
       const HH20 = Math.max(...h1.map(b=>+b[2]));
       const LL20 = Math.min(...h1.map(b=>+b[3]));
+
       const midnight = new Date(); midnight.setUTCHours(0,0,0,0);
       const vBars = await safeJson(`https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=1m&startTime=${midnight.getTime()}&limit=1440`);
       let vSum=0, pvSum=0, pv2=0;
@@ -339,44 +290,93 @@ async function buildDashboardData () {
         pvSum += px * vol;
         pv2   += px * px * vol;
       });
-      const vwap  = pvSum / vSum;
-      const sigma = Math.sqrt(Math.max(pv2/vSum - vwap*vwap, 0));
-      result.dataF.levels = {
-        pivot:   +pivot.toFixed(2),
-        R1:      +R1.toFixed(2),
-        S1:      +S1.toFixed(2),
-        HH20:    +HH20.toFixed(2),
-        LL20:    +LL20.toFixed(2),
-        vwap:    +vwap.toFixed(2),
-        vwapUpper:+(vwap+sigma).toFixed(2),
-        vwapLower:+(vwap-sigma).toFixed(2)
+      const vwap  = vSum ? (pvSum / vSum) : +last1m[0][4];
+      const sigma = Math.sqrt(Math.max(vSum ? (pv2/vSum - vwap*vwap) : 0, 0));
+
+      // Rolling highs/lows from daily bars
+      const highs1d = bars1d.map(r=>+r[2]);
+      const lows1d  = bars1d.map(r=>+r[3]);
+      const closes1d= bars1d.map(r=>+r[4]);
+      const len = highs1d.length;
+      const sliceN = (arr,n)=>arr.length>=n?arr.slice(-n):arr.slice(0);
+
+      const rolling7dHigh  = Math.max(...sliceN(highs1d,7));
+      const rolling7dLow   = Math.min(...sliceN(lows1d,7));
+      const rolling30dHigh = Math.max(...sliceN(highs1d,30));
+      const rolling30dLow  = Math.min(...sliceN(lows1d,30));
+
+      // Confirmed swings (fractal n=2)
+      const n=2, startIdx = Math.max(0, len-30), endIdx = len-1;
+      const swingHighs=[], swingLows=[];
+      for (let i=n; i<len-n; i++){
+        if (highs1d[i] === Math.max(...highs1d.slice(i-n, i+n+1)))
+          swingHighs.push({ idx:i, price:highs1d[i] });
+        if (lows1d[i] === Math.min(...lows1d.slice(i-n, i+n+1)))
+          swingLows.push({ idx:i, price:lows1d[i] });
+      }
+      const swingHighs30 = swingHighs.filter(s=>s.idx>=startIdx);
+      const swingLows30  = swingLows.filter(s=>s.idx>=startIdx);
+
+      // Horizontal swing levels (most recent confirmed inside 30d)
+      const rolling30dSwingHigh = swingHighs30.length ? swingHighs30.at(-1).price : null;
+      const rolling30dSwingLow  = swingLows30.length  ? swingLows30.at(-1).price  : null;
+
+      // Sloping swing lines (Option B: dominant diagonal inside 30d with filters)
+      const tolerance = 0.002;        // 0.2% proximity
+      const minRecentBars = 10;       // at least one anchor in last 10 days
+      const SLOPE_MIN = 0.05;         // USD/day (near-horizontal filter)
+      const SLOPE_MAX = 500;          // USD/day (absurdly steep filter)
+
+      const pickBestLine = (pivots, side /* "high"|"low" */) => {
+        if (!pivots || pivots.length < 2) return null;
+        const recentCut = len - minRecentBars;
+        let best = null;
+
+        for (let a=0; a<pivots.length-1; a++){
+          for (let b=a+1; b<pivots.length; b++){
+            const A = pivots[a], B = pivots[b];
+            if (A.idx < startIdx || B.idx < startIdx) continue; // ensure inside 30d window
+            // Recency filter: at least one anchor in last X days
+            if (A.idx < recentCut && B.idx < recentCut) continue;
+
+            const slope = (B.price - A.price) / (B.idx - A.idx);
+            const absSlope = Math.abs(slope);
+            if (absSlope < SLOPE_MIN || absSlope > SLOPE_MAX) continue;
+
+            const intercept = A.price - slope * A.idx;
+
+            // Touch count within tolerance across window
+            let touches = 0;
+            for (let k = startIdx; k <= endIdx; k++){
+              const linePrice = slope * k + intercept;
+              if (side === "high") {
+                if (Math.abs(highs1d[k] - linePrice) / (linePrice || 1) <= tolerance) touches++;
+              } else {
+                if (Math.abs(lows1d[k] - linePrice) / (linePrice || 1) <= tolerance) touches++;
+              }
+            }
+            if (touches < 2) continue;
+
+            // Selection criterion: for highs, maximize today's projected level; for lows, minimize it
+            const todayIdx = endIdx;
+            const projToday = slope * todayIdx + intercept;
+
+            if (!best) {
+              best = { slope, intercept, score: projToday };
+            } else if (side === "high" ? (projToday > best.score) : (projToday < best.score)) {
+              best = { slope, intercept, score: projToday };
+            }
+          }
+        }
+        if (!best) return null;
+        return {
+          slope: +best.slope.toFixed(6),
+          intercept: +best.intercept.toFixed(2)
+        };
       };
-    }
-  } catch(e) {
-    result.errors.push("F: "+e.message);
-  }
 
-  /* BLOCK G --------------------------------------------------------------- */
-  try{
-    const gv=await safeJson("https://api.coingecko.com/api/v3/global"), d=gv.data;
-    result.dataG={
-      totalMcapT:+(d.total_market_cap.usd/1e12).toFixed(2),
-      mcap24hPct:+d.market_cap_change_percentage_24h_usd.toFixed(2),
-      btcDominance:+d.market_cap_percentage.btc.toFixed(2),
-      ethDominance:+d.market_cap_percentage.eth.toFixed(2)
-    };
-  }catch(e){
-    result.errors.push("G: "+e.message);
-  }
+      const rolling30dSwingHighLine = pickBestLine(swingHighs30, "high");
+      const rolling30dSwingLowLine  = pickBestLine(swingLows30,  "low");
 
-  /* BLOCK H --------------------------------------------------------------- */
-  try{
-    const fg=await safeJson("https://api.alternative.me/fng/?limit=1"), row=fg.data?.[0];
-    if(!row) throw new Error("FNG missing");
-    result.dataH={fearGreed:`${row.value} · ${row.value_classification}`};
-  }catch(e){
-    result.errors.push("H: "+e.message);
-  }
-
-  return result;
-}
+      // EMAs (4h and 1d)
+      const closes4h = bars4
